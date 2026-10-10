@@ -57,7 +57,6 @@ struct DriverDmem {
 };
 
 static DriverDmem g_driver_dmem;
-static int InitializeDmem();
 static void ReleaseDmem();
 
 } // namespace Gen5Driver
@@ -82,6 +81,8 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// Native driver module startup reserves its DMEM before the guest can allocate it.
+	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();
 }
 
@@ -356,38 +357,6 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	}
 
 	printf("version = %u\n", ver);
-	std::scoped_lock lock {Gen5Driver::g_driver_dmem.mutex};
-	if (Gen5Driver::g_driver_dmem.physical_offset >= 0) {
-		return OK;
-	}
-	if (const auto result = Gen5Driver::InitializeDmem(); result != OK) {
-		return result;
-	}
-	struct FunctionShaderBindings {
-		uint64_t code;
-		uint32_t user_data[2];
-	};
-	static_assert(sizeof(FunctionShaderBindings) == 16);
-	// Ordered-count queue validator, including its return to the caller.
-	static constexpr std::array<uint32_t, 16> validator {
-	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
-	    0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
-	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
-	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
-	};
-	const auto base = Gen5Driver::DriverDmemBase + Gen5Driver::AgcDmemOffset;
-	const auto function_table = base + 0x60;
-	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
-	std::array<FunctionShaderBindings, 8> functions {};
-	functions[2].code = code_address;
-	const std::array<uint32_t, 4> descriptor {
-	    static_cast<uint32_t>(function_table),
-	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
-	    static_cast<uint32_t>(functions.size()), 0x5204u,
-	};
-	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
-	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
-	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 
 	return OK;
 }
@@ -4288,7 +4257,11 @@ namespace Gen5Driver {
 
 LIB_NAME("Graphics5Driver", "Graphics5Driver");
 
-static int InitializeDmem() {
+int Initialize() {
+	std::scoped_lock lock {g_driver_dmem.mutex};
+	if (g_driver_dmem.physical_offset >= 0) {
+		return OK;
+	}
 	int64_t physical_offset = -1;
 	auto result = LibKernel::Memory::KernelAllocateDirectMemory(
 	    0, LibKernel::Memory::KernelGetDirectMemorySize(), DriverDmemSize, DriverDmemSize,
@@ -4305,6 +4278,31 @@ static int InitializeDmem() {
 	}
 	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
 	std::memset(address, 0, DriverDmemSize);
+	struct FunctionShaderBindings {
+		uint64_t code;
+		uint32_t user_data[2];
+	};
+	static_assert(sizeof(FunctionShaderBindings) == 16);
+	// Ordered-count queue validator, including its return to the caller.
+	static constexpr std::array<uint32_t, 16> validator {
+	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
+	    0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
+	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
+	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
+	};
+	const auto base = DriverDmemBase + AgcDmemOffset;
+	const auto function_table = base + 0x60;
+	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
+	std::array<FunctionShaderBindings, 8> functions {};
+	functions[2].code = code_address;
+	const std::array<uint32_t, 4> descriptor {
+	    static_cast<uint32_t>(function_table),
+	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
+	    static_cast<uint32_t>(functions.size()), 0x5204u,
+	};
+	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
+	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
+	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 	g_driver_dmem.physical_offset = physical_offset;
 	return OK;
 }
