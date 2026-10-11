@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -86,6 +87,48 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 	if (unknown != 0) {
 		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
 	}
+}
+
+// SET_*_REG_INDIRECT register pairs live in guest memory the GPU may also write. On a page that
+// is protected because the GPU wrote some of its bytes, every load of the pair loop faults and the
+// fault handler emulates it, so one packet can cost many exceptions. In UFC 5 fights the CX
+// packets alone took ~15 us each and 30% of the GPU thread (Tracy, 2026-10-10), while the
+// draw-prep scanner, which copies the same pairs out first, ran them at ~0.2 us.
+// On the GPU thread the pairs are copied with one clean-backing read, as the scanner does. When
+// the bytes may be GPU-written the copy is refused and the handler reads guest memory directly,
+// as before, so the fault path still downloads them first.
+// KYTY_INDIRECT_CLEAN_COPY=0 always reads guest memory directly.
+bool IndirectCleanCopyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_CLEAN_COPY");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Indirect register pairs: clean copy %s (KYTY_INDIRECT_CLEAN_COPY)\n", on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+// Only the GPU thread counts, so plain counters suffice; logged every 2^20 packets.
+uint64_t g_indirect_copied = 0;
+uint64_t g_indirect_direct = 0;
+
+const uint32_t* IndirectRegisterPairs(const uint32_t* guest_pairs, uint32_t num_pairs) {
+	// The draw-prep scanner hands these handlers its own host copy; only the GPU thread reads
+	// guest memory here.
+	if (!IndirectCleanCopyEnabled() || !GuestGpu::IsGpuThread()) {
+		return guest_pairs;
+	}
+	KYTY_PROFILER_BLOCK("IndirectRegisterPairs (clean copy)");
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(static_cast<size_t>(num_pairs) * 2u);
+	const bool copied = LibKernel::Memory::TryReadGpuCleanBacking(
+	    reinterpret_cast<uint64_t>(guest_pairs), copy.data(), copy.size() * sizeof(uint32_t));
+	(copied ? g_indirect_copied : g_indirect_direct)++;
+	if (((g_indirect_copied + g_indirect_direct) & ((uint64_t {1} << 20u) - 1u)) == 0) {
+		LOGF("Indirect register pairs: %" PRIu64 " copied, %" PRIu64 " read from guest memory\n",
+		     g_indirect_copied, g_indirect_direct);
+	}
+	return copied ? copy.data() : guest_pairs;
 }
 
 } // namespace
@@ -1960,7 +2003,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -1971,6 +2014,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2030,7 +2074,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -2042,6 +2086,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	indirect_buffer             = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2093,7 +2138,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -2104,6 +2149,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
