@@ -3722,6 +3722,20 @@ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication
 	return OK;
 }
 
+int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
+	PRINT_NAME();
+
+	const auto size = AgcGetPacketSize(packet);
+
+	packet[0] = (packet[0] & 0xffff0003u) | (Pm4::IT_NOP << 8u);
+	// Prevent the disabled payload from being treated as an executable marker.
+	if (size > 1 && (packet[1] & 0xffff0000u) == 0x68750000u) {
+		packet[1] &= 0xffffu;
+	}
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                          uint32_t predication) {
 	PRINT_NAME();
