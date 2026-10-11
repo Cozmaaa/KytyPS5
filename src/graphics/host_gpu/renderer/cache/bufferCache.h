@@ -99,6 +99,9 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
 	                                                               BufferId id);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Gives guest memory the bytes a just-recorded GPU fill writes (a DMA fill, or a dispatch
+	// proven to store one value everywhere), so they stop being GPU-written.
+	void PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -137,8 +140,6 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
-	// Gives guest memory the bytes a GPU fill just recorded, so they stop being GPU-written.
-	void PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);

@@ -555,6 +555,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// The dispatch as the guest requested it, before thread dimensions become workgroups.
+	const std::array<uint32_t, 3> requested_groups {thread_group_x, thread_group_y, thread_group_z};
+
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
@@ -690,7 +693,60 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
+	PublishComputeBufferFill(input_info, requested_groups, mode);
 	ResetBindings();
+}
+
+// A dispatch proven to store one value into every element of one buffer (uniform fill,
+// ResolveComputeBufferFill) that is not an image clear still runs, and its bytes become
+// GPU-written: the next CPU read of them drains the GPU. In UFC 5 fights the game stamps
+// DCC fast-clear codes into color metadata this way (shader 0x723423f5115aedbd), and each
+// color-target bind then drained the GPU to read the code back (TextureCache::
+// MaterializeColorClear), ~4 times a frame. The value is known here, so guest memory is given
+// the same bytes now (BufferCache::PublishFill), as for DMA fills.
+// KYTY_CLEAN_COMPUTE_FILLS=0 leaves them GPU-written as before.
+void RenderExecutor::PublishComputeBufferFill(const ShaderComputeInputInfo& input,
+                                              const std::array<uint32_t, 3>& groups,
+                                              uint32_t                       mode) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CLEAN_COMPUTE_FILLS");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Dispatch: clean compute fills %s (KYTY_CLEAN_COMPUTE_FILLS)\n", on ? "on" : "off");
+		return on;
+	}();
+	const auto& resources = *input.stage.resources;
+	if (!enabled || resources.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+		return;
+	}
+	static uint64_t published = 0;
+	static uint64_t rejected  = 0;
+	ShaderBufferResource descriptor;
+	uint32_t             value = 0;
+	uint64_t             size  = 0;
+	if (!ResolveComputeBufferFill(input, groups[0], groups[1], groups[2], mode, descriptor, value,
+	                              size)) {
+		// Diagnostics: why a uniform fill is not proven to cover its whole buffer.
+		if (++rejected <= 16) {
+			const auto& fill = resources.uniform_fill;
+			const auto  raw =
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+			LOGF("Dispatch: uniform fill not published: shader=0x%016" PRIx64
+			     " addr=0x%016" PRIx64 " stride=%u records=%u format=%u words=%u"
+			     " group_stride=%u threads=%ux%ux%u groups=%ux%ux%u mode=0x%x thread_dims=%d\n",
+			     input.stage.program->shader_hash, raw.Base48(), raw.Stride(), raw.NumRecords(),
+			     raw.RawFormat(), fill.words, fill.group_stride[0], input.threads_num[0],
+			     input.threads_num[1], input.threads_num[2], groups[0], groups[1], groups[2], mode,
+			     input.dispatch_thread_dimensions ? 1 : 0);
+		}
+		return;
+	}
+	m_context.GetBufferCache().PublishFill(descriptor.Base48(), size, value);
+	if (++published <= 8 || published % 4096 == 0) {
+		LOGF("Dispatch: uniform fill published #%" PRIu64 " (%" PRIu64 " rejected): shader=0x%016" PRIx64
+		     " addr=0x%016" PRIx64 " size=0x%" PRIx64 " value=0x%08" PRIx32 "\n",
+		     published, rejected, input.stage.program->shader_hash, descriptor.Base48(), size,
+		     value);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
