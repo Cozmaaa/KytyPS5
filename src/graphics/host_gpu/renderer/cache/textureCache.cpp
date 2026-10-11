@@ -1280,9 +1280,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
-		// Uniform fills of exactly this range may be published to guest memory (BufferCache::
-		// PublishFill): this check is their only CPU reader.
-		m_color_metadata_ranges[range.address] = range.size;
 		// A fast-clear stamps the whole DCC metadata range with one uniform code; an ordinary
 		// draw also touches these bytes (per-block compression state) but leaves a mixed
 		// pattern, so it never passes the all-same-code check below -- yet it re-marks the range
@@ -1314,45 +1311,54 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto slice_size = range.size / layers;
+	// GPU-written metadata whose bytes a recorded fill still accounts for (BufferCache::
+	// TryKnownFill) is read from that record, slice by slice, instead of downloading: a download
+	// submits and drains the GPU. Diagnostics count both.
+	static uint64_t known_slices      = 0;
+	static uint64_t downloaded_checks = 0;
+	std::vector<uint32_t> known_values(count, 0);
+	std::vector<uint8_t>  known(count, 0);
+	bool                  all_known = false;
+	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size) &&
+	    m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+		all_known = true;
+		for (uint32_t slice = 0; slice < count; slice++) {
+			const auto address = range.address + slice_size * (first + slice);
+			known[slice] = m_buffer_cache.TryKnownFill(address, slice_size, known_values[slice]) ? 1 : 0;
+			all_known    = all_known && known[slice] != 0;
+		}
+	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		// Diagnostics: how many checks find GPU-written metadata bytes and so drain the GPU;
-		// clean fills (BufferCache::PublishFill) leave none. The first ranges are named for
-		// KYTY_WATCH_GPU_WRITE, which names the bindings that write them.
-		static uint64_t drained = 0;
-		static uint64_t clean   = 0;
+	if (!all_known && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		std::fill(known.begin(), known.end(), uint8_t {0});
 		if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
-			if (++drained <= 16) {
-				LOGF("TextureCache: color metadata check drains the GPU: range=0x%016" PRIx64
-				     "+0x%" PRIx64 "\n",
-				     range.address, range.size);
-			}
-		} else {
-			clean++;
+			downloaded_checks++;
 		}
-		if ((drained + clean) % 1024 == 0) {
-			LOGF("TextureCache: color metadata checks %" PRIu64 " drained, %" PRIu64
-			     " without GPU-written bytes\n",
-			     drained, clean);
-		}
-		KYTY_PROFILER_BLOCK("MaterializeColorClear metadata readback");
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	} else if (all_known) {
+		known_slices += count;
 	}
-	const auto slice_size = range.size / layers;
+	if ((known_slices + downloaded_checks) % 1024 == 1 && (known_slices | downloaded_checks) != 0) {
+		LOGF("TextureCache: color metadata from known fills %" PRIu64 " slices, downloaded %" PRIu64
+		     " checks\n",
+		     known_slices, downloaded_checks);
+	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+		std::vector<uint8_t> bytes(slice_size);
+		if (known[slice] != 0) {
+			for (uint64_t i = 0; i < slice_size; i++) {
+				bytes[i] = static_cast<uint8_t>(known_values[slice] >> (8u * (i & 3u)));
+			}
+		} else if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
+		const uint8_t  code = bytes[0];
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
-		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
@@ -1362,6 +1368,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			ClearImage(m_scheduler.Current(), id, view.format,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
+		}
+		// Known metadata is still GPU-written: the expanded keys go to the GPU copy, in order,
+		// and are recorded, so the next check reads them without a download either.
+		if (known[slice] != 0) {
+			if (desc.type != BindingType::VideoOut) {
+				m_buffer_cache.FillKnown(address, slice_size, 0xffffffffu);
+			}
+			continue;
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -2167,12 +2181,6 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
-}
-
-bool TextureCache::IsKnownColorMetadata(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
-	const auto       found = m_color_metadata_ranges.find(address);
-	return found != m_color_metadata_ranges.end() && found->second == size;
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {

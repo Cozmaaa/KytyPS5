@@ -99,10 +99,15 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
 	                                                               BufferId id);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
-	// Gives guest memory the bytes a just-recorded GPU fill writes (a DMA fill, or a dispatch
-	// proven to store one value everywhere), so they stop being GPU-written.
-	// False when the bytes stay GPU-written (see there).
-	bool PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// Known fills: the value a recorded GPU fill (DMA fill, uniform-fill dispatch, FillKnown)
+	// leaves in a range, until any later GPU write marks bytes of it. Guest memory and the
+	// GPU-written state are not touched: a CPU reader that needs the bytes still downloads them.
+	// TryKnownFill answers only for a range wholly covered by such fills of one value.
+	void               RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value);
+	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
+	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
+	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -217,6 +222,9 @@ private:
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
+	// Known fills (RecordKnownFill): begin -> (end, value), non-overlapping. Guarded by
+	// m_dirty_ranges_mutex; MarkGpuWritten drops every one it overlaps.
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>>  m_known_fills;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against

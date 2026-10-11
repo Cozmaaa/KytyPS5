@@ -249,8 +249,8 @@ private:
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
-	void PublishComputeBufferFill(const ShaderComputeInputInfo& input,
-	                              const std::array<uint32_t, 3>& groups, uint32_t mode);
+	void RecordComputeBufferFill(const ShaderComputeInputInfo& input,
+	                             const std::array<uint32_t, 3>& groups, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

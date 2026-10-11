@@ -1144,6 +1144,16 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// Any GPU write ends what a recorded fill says about these bytes.
+		if (!m_known_fills.empty()) {
+			auto it = m_known_fills.upper_bound(vaddr);
+			if (it != m_known_fills.begin() && std::prev(it)->second.first > vaddr) {
+				--it;
+			}
+			while (it != m_known_fills.end() && it->first < vaddr + size) {
+				it = m_known_fills.erase(it);
+			}
+		}
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
@@ -1239,91 +1249,80 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
-	PublishFill(vaddr, size, value);
+	RecordKnownFill(vaddr, size, value);
 }
 
-// A GPU fill leaves its bytes GPU-written, so the next CPU-side read of them downloads them and
-// drains the GPU. Their value is known when the fill is recorded, so guest memory is given the
-// same bytes now, as WriteClean does for WRITE_DATA, and they stop being GPU-written. The fill
-// itself still runs on the GPU in order, so the GPU copy ends with the same bytes; a later GPU
-// write marks them again.
-// In UFC 5 fights, DCC fast-clear checks on color-target binds (TextureCache::
-// MaterializeColorClear) drained the GPU ~4 times a frame for ~3 ms each, 27% of the GPU thread
-// (Tracy, 2026-10-11). KYTY_CLEAN_FILLS=0 leaves fills GPU-written as before;
-// KYTY_CLEAN_FILLS_MAX_KB (default 1024) bounds the bytes written on the CPU per fill.
-static bool CleanFillsEnabled() {
+// Known fills. A fill's bytes stay GPU-written, so a CPU reader of them downloads them and drains
+// the GPU. TextureCache::MaterializeColorClear reads color DCC/CMask metadata that way on every
+// color-target bind, for the fast-clear code a fill (in UFC 5 a uniform-fill dispatch, shader
+// 0x723423f5115aedbd) stamped there: ~4 drains a frame, ~3 ms each, 27% of the GPU thread in
+// fights (Tracy, 2026-10-11). The value is known when the fill is recorded, so that reader asks
+// here first. Nothing else changes: an earlier version gave guest memory the filled bytes and
+// dropped them from the GPU-written ranges, and the UFC 5 main menu then faulted the GPU on a
+// null pointer, since later GPU writes to reused memory are not all marked GPU-written.
+// KYTY_KNOWN_FILLS=0 records none, so every such read downloads as before.
+static bool KnownFillsEnabled() {
 	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_CLEAN_FILLS");
+		const char* value = std::getenv("KYTY_KNOWN_FILLS");
 		const bool  on    = value == nullptr || value[0] != '0';
-		LOGF("BufferCache: clean fills %s (KYTY_CLEAN_FILLS)\n", on ? "on" : "off");
+		LOGF("BufferCache: known fills %s (KYTY_KNOWN_FILLS)\n", on ? "on" : "off");
 		return on;
 	}();
 	return enabled;
 }
 
-static uint64_t CleanFillsMaxBytes() {
-	static const uint64_t bytes = [] {
-		const char* value = std::getenv("KYTY_CLEAN_FILLS_MAX_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) * 1024u;
-	}();
-	return bytes;
+void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if (!KnownFillsEnabled() || size == 0) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	// Transient allocations move around; the table is a cache of recent fills, not a history.
+	if (m_known_fills.size() >= 8192) {
+		m_known_fills.clear();
+	}
+	auto it = m_known_fills.upper_bound(vaddr);
+	if (it != m_known_fills.begin() && std::prev(it)->second.first > vaddr) {
+		--it;
+	}
+	while (it != m_known_fills.end() && it->first < vaddr + size) {
+		it = m_known_fills.erase(it);
+	}
+	m_known_fills.emplace(vaddr, std::pair {vaddr + size, value});
 }
 
-bool BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
-	if (!CleanFillsEnabled()) {
+bool BufferCache::TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	if (m_known_fills.empty() || size == 0) {
 		return false;
 	}
-	static uint64_t published = 0;
-	static uint64_t skipped   = 0;
-	const auto      report    = [] {
-		if ((published + skipped) % 4096 == 1) {
-			LOGF("BufferCache: clean fills %" PRIu64 " published, %" PRIu64 " left GPU-written\n",
-			     published, skipped);
-		}
-	};
-	if (!GuestGpu::IsGpuThread() || size > CleanFillsMaxBytes()) {
-		skipped++;
-		report();
+	auto it = m_known_fills.upper_bound(vaddr);
+	if (it == m_known_fills.begin()) {
 		return false;
 	}
-	// Only the color metadata whose fast-clear code TextureCache::MaterializeColorClear reads.
-	// The same fill shaders also zero other buffers that later GPU writes fill in without always
-	// marking them GPU-written again: published, those read back as the fill's zeros, and a
-	// null pointer read from one faulted the GPU (UFC 5 main menu, 2026-10-11).
-	// KYTY_CLEAN_FILLS_ANY=1 publishes every fill, as the first version did.
-	static const bool any_range = [] {
-		const char* value = std::getenv("KYTY_CLEAN_FILLS_ANY");
-		return value != nullptr && value[0] == '1';
-	}();
-	if (!any_range && !m_texture_cache.IsKnownColorMetadata(vaddr, size)) {
-		skipped++;
-		report();
+	--it;
+	if (it->first > vaddr || it->second.first <= vaddr) {
 		return false;
 	}
-	{
-		// A download in flight would later publish the GPU's older bytes over the fill.
-		std::shared_lock lock(m_dirty_ranges_mutex);
-		if (m_downloading_ranges.Intersects(vaddr, size)) {
-			skipped++;
-			report();
+	const auto first = it->second.second;
+	auto       end   = it->second.first;
+	while (end < vaddr + size) {
+		++it;
+		if (it == m_known_fills.end() || it->first != end || it->second.second != first) {
 			return false;
 		}
+		end = it->second.first;
 	}
-	thread_local std::vector<uint32_t> words;
-	words.assign(static_cast<size_t>(size / sizeof(uint32_t)), value);
-	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, words.data(), size)) {
-		skipped++;
-		report();
-		return false;
-	}
-	{
-		// Overwritten in full: guest memory holds the value the GPU copy will have.
-		std::unique_lock lock(m_dirty_ranges_mutex);
-		m_gpu_modified_ranges.Subtract(vaddr, size);
-	}
-	published++;
-	report();
+	value = first;
 	return true;
+}
+
+void BufferCache::FillKnown(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0) {
+		EXIT("BufferCache: fill range must be dword aligned\n");
+	}
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	dst->Fill(dst_offset, size, value);
+	RecordKnownFill(vaddr, size, value);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
