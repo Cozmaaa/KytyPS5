@@ -1239,6 +1239,76 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	PublishFill(vaddr, size, value);
+}
+
+// A GPU fill leaves its bytes GPU-written, so the next CPU-side read of them downloads them and
+// drains the GPU. Their value is known when the fill is recorded, so guest memory is given the
+// same bytes now, as WriteClean does for WRITE_DATA, and they stop being GPU-written. The fill
+// itself still runs on the GPU in order, so the GPU copy ends with the same bytes; a later GPU
+// write marks them again.
+// In UFC 5 fights, DCC fast-clear checks on color-target binds (TextureCache::
+// MaterializeColorClear) drained the GPU ~4 times a frame for ~3 ms each, 27% of the GPU thread
+// (Tracy, 2026-10-11). KYTY_CLEAN_FILLS=0 leaves fills GPU-written as before;
+// KYTY_CLEAN_FILLS_MAX_KB (default 1024) bounds the bytes written on the CPU per fill.
+static bool CleanFillsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CLEAN_FILLS");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("BufferCache: clean fills %s (KYTY_CLEAN_FILLS)\n", on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+static uint64_t CleanFillsMaxBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_CLEAN_FILLS_MAX_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) * 1024u;
+	}();
+	return bytes;
+}
+
+void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if (!CleanFillsEnabled()) {
+		return;
+	}
+	static uint64_t published = 0;
+	static uint64_t skipped   = 0;
+	const auto      report    = [] {
+		if ((published + skipped) % 4096 == 1) {
+			LOGF("BufferCache: clean fills %" PRIu64 " published, %" PRIu64 " left GPU-written\n",
+			     published, skipped);
+		}
+	};
+	if (!GuestGpu::IsGpuThread() || size > CleanFillsMaxBytes()) {
+		skipped++;
+		report();
+		return;
+	}
+	{
+		// A download in flight would later publish the GPU's older bytes over the fill.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(vaddr, size)) {
+			skipped++;
+			report();
+			return;
+		}
+	}
+	thread_local std::vector<uint32_t> words;
+	words.assign(static_cast<size_t>(size / sizeof(uint32_t)), value);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, words.data(), size)) {
+		skipped++;
+		report();
+		return;
+	}
+	{
+		// Overwritten in full: guest memory holds the value the GPU copy will have.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
+	published++;
+	report();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

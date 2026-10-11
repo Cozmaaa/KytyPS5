@@ -137,6 +137,8 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	// Gives guest memory the bytes a GPU fill just recorded, so they stop being GPU-written.
+	void PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);

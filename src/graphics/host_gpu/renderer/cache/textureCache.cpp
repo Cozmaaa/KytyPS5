@@ -1314,6 +1314,26 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// Diagnostics: how many checks find GPU-written metadata bytes and so drain the GPU;
+		// clean fills (BufferCache::PublishFill) leave none. The first ranges are named for
+		// KYTY_WATCH_GPU_WRITE, which names the bindings that write them.
+		static uint64_t drained = 0;
+		static uint64_t clean   = 0;
+		if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+			if (++drained <= 16) {
+				LOGF("TextureCache: color metadata check drains the GPU: range=0x%016" PRIx64
+				     "+0x%" PRIx64 "\n",
+				     range.address, range.size);
+			}
+		} else {
+			clean++;
+		}
+		if ((drained + clean) % 1024 == 0) {
+			LOGF("TextureCache: color metadata checks %" PRIu64 " drained, %" PRIu64
+			     " without GPU-written bytes\n",
+			     drained, clean);
+		}
+		KYTY_PROFILER_BLOCK("MaterializeColorClear metadata readback");
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
