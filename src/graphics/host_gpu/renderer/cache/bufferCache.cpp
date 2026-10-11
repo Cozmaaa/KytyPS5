@@ -1269,9 +1269,9 @@ static uint64_t CleanFillsMaxBytes() {
 	return bytes;
 }
 
-void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+bool BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	if (!CleanFillsEnabled()) {
-		return;
+		return false;
 	}
 	static uint64_t published = 0;
 	static uint64_t skipped   = 0;
@@ -1284,7 +1284,21 @@ void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	if (!GuestGpu::IsGpuThread() || size > CleanFillsMaxBytes()) {
 		skipped++;
 		report();
-		return;
+		return false;
+	}
+	// Only the color metadata whose fast-clear code TextureCache::MaterializeColorClear reads.
+	// The same fill shaders also zero other buffers that later GPU writes fill in without always
+	// marking them GPU-written again: published, those read back as the fill's zeros, and a
+	// null pointer read from one faulted the GPU (UFC 5 main menu, 2026-10-11).
+	// KYTY_CLEAN_FILLS_ANY=1 publishes every fill, as the first version did.
+	static const bool any_range = [] {
+		const char* value = std::getenv("KYTY_CLEAN_FILLS_ANY");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!any_range && !m_texture_cache.IsKnownColorMetadata(vaddr, size)) {
+		skipped++;
+		report();
+		return false;
 	}
 	{
 		// A download in flight would later publish the GPU's older bytes over the fill.
@@ -1292,7 +1306,7 @@ void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 		if (m_downloading_ranges.Intersects(vaddr, size)) {
 			skipped++;
 			report();
-			return;
+			return false;
 		}
 	}
 	thread_local std::vector<uint32_t> words;
@@ -1300,7 +1314,7 @@ void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, words.data(), size)) {
 		skipped++;
 		report();
-		return;
+		return false;
 	}
 	{
 		// Overwritten in full: guest memory holds the value the GPU copy will have.
@@ -1309,6 +1323,7 @@ void BufferCache::PublishFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	}
 	published++;
 	report();
+	return true;
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

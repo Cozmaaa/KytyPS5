@@ -1280,6 +1280,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
+		// Uniform fills of exactly this range may be published to guest memory (BufferCache::
+		// PublishFill): this check is their only CPU reader.
+		m_color_metadata_ranges[range.address] = range.size;
 		// A fast-clear stamps the whole DCC metadata range with one uniform code; an ordinary
 		// draw also touches these bytes (per-block compression state) but leaves a mixed
 		// pattern, so it never passes the all-same-code check below -- yet it re-marks the range
@@ -2164,6 +2167,12 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsKnownColorMetadata(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_color_metadata_ranges.find(address);
+	return found != m_color_metadata_ranges.end() && found->second == size;
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {

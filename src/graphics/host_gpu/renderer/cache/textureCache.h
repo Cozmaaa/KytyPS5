@@ -76,6 +76,9 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// Whether [address, address + size) is exactly the DCC or CMask metadata of a color target
+	// whose fast-clear code MaterializeColorClear has read. GPU thread only.
+	[[nodiscard]] bool IsKnownColorMetadata(uint64_t address, uint64_t size);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -212,6 +215,8 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Color DCC/CMask metadata ranges (address -> size) MaterializeColorClear has read.
+	std::unordered_map<uint64_t, uint64_t>            m_color_metadata_ranges;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

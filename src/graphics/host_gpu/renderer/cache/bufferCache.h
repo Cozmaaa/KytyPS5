@@ -101,7 +101,8 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// Gives guest memory the bytes a just-recorded GPU fill writes (a DMA fill, or a dispatch
 	// proven to store one value everywhere), so they stop being GPU-written.
-	void PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// False when the bytes stay GPU-written (see there).
+	bool PublishFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

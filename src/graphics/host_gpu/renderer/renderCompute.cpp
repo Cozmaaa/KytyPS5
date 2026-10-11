@@ -740,7 +740,9 @@ void RenderExecutor::PublishComputeBufferFill(const ShaderComputeInputInfo& inpu
 		}
 		return;
 	}
-	m_context.GetBufferCache().PublishFill(descriptor.Base48(), size, value);
+	if (!m_context.GetBufferCache().PublishFill(descriptor.Base48(), size, value)) {
+		return;
+	}
 	if (++published <= 8 || published % 4096 == 0) {
 		LOGF("Dispatch: uniform fill published #%" PRIu64 " (%" PRIu64 " rejected): shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%" PRIx64 " value=0x%08" PRIx32 "\n",
