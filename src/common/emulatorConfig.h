@@ -82,7 +82,8 @@ struct ConfigOptions {
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
-	std::vector<std::string> guest_arguments;
+	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
+	std::vector<std::string> guest_arguments {""};
 };
 
 void Load(const ConfigOptions& cfg);
