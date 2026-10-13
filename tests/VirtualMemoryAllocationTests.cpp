@@ -109,6 +109,18 @@ struct TestFailure {};
 
 int g_failed_tests = 0;
 
+struct GpuRangeEvent {
+	bool mapped;
+	uint64_t address;
+	size_t size;
+	bool operator==(const GpuRangeEvent&) const = default;
+};
+std::vector<GpuRangeEvent> g_gpu_range_events;
+
+void ObserveGpuRange(bool mapped, uint64_t address, size_t size) {
+	g_gpu_range_events.push_back({mapped, address, size});
+}
+
 [[noreturn]] void Fail(const char* test, const std::string& message) {
 	std::fflush(stdout);
 	std::fprintf(stderr, "VirtualMemoryAllocationTests: %s failed: %s\n", test, message.c_str());
@@ -2669,6 +2681,14 @@ void TestAutomaticMemoryReuseAndAliases() {
 	constexpr uint64_t base     = kExtendedMemoryBase + 0x20000000;
 	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
 	int64_t            physical = -1;
+	CheckOk(test, UnmapAmmMemory(base, block), "AMM unmap empty range");
+	Check(test, KernelMunmap(base, block) == Libs::LibKernel::KERNEL_ERROR_EACCES,
+	      "kernel unmap unexpectedly accepted an empty range");
+	for (const auto [address, size] : {std::pair{base + 1, page}, {base, page - 1},
+	                                  {kExtendedMemoryBase - page, page},
+	                                  {kExtendedMemoryBase + kExtendedMemorySize - page, page * 2}})
+		Check(test, UnmapAmmMemory(address, size) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "AMM unmap accepted an unaligned or out-of-domain range");
 	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
 	        "allocate automatic backing");
 	CheckOk(test, MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw),
@@ -2691,7 +2711,18 @@ void TestAutomaticMemoryReuseAndAliases() {
 	      MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "restored mappings remained available to the automatic allocator");
-	CheckOk(test, KernelMunmap(base, block), "KernelMunmap(original)");
+	TestFailPhysicalMemoryUnmapAfter(0);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	const int unmap_result = UnmapAmmMemory(base - page, block + page * 2);
+	TestSetGpuRangeCallback(nullptr);
+	CheckFailed(test, unmap_result, "AMM unmap owner failure");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent>{{false, base, block}, {true, base, block}},
+	      "failed AMM unmap did not restore exactly the surviving GPU range");
+	Check(test, *reinterpret_cast<uint64_t*>(base + page * 3) == 0x0123456789abcdefull,
+	      "failed AMM unmap did not restore the original backing");
+	CheckOk(test, UnmapAmmMemory(base - page, block + page * 2),
+	        "AMM unmap original with leading and trailing holes");
 	Check(test,
 	      MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
@@ -2702,20 +2733,22 @@ void TestAutomaticMemoryReuseAndAliases() {
 	      Query(test, base).offset == static_cast<uint64_t>(physical) &&
 	          Query(test, base + page).offset == static_cast<uint64_t>(physical + page * 4),
 	      "automatic allocation did not skip the union of overlapping aliases");
-	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(first_alias), page * 3),
-	        "KernelMunmap(first alias)");
+	CheckOk(test, UnmapAmmMemory(reinterpret_cast<uint64_t>(first_alias), page * 3),
+	        "AMM unmap first alias");
 	CheckOk(test, MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw),
 	        "MapAutomaticMemory(partial alias release)");
 	Check(test, Query(test, base + block * 4).offset == static_cast<uint64_t>(physical + page),
 	      "partial alias release did not reclaim its unreferenced page");
-	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(second_alias), page),
-	        "KernelMunmap(partial second alias)");
+	CheckOk(test, UnmapAmmMemory(reinterpret_cast<uint64_t>(first_alias), block + page),
+	        "AMM unmap holes and partial second alias");
 	CheckOk(test, MapAutomaticMemory(base + block * 5, page, SceKernelMtypeC, SceKernelProtCpuRw),
 	        "MapAutomaticMemory(partial unmap)");
 	Check(test, Query(test, base + block * 5).offset == static_cast<uint64_t>(physical + page * 2),
 	      "partial unmap did not reclaim the matching physical page");
 	Check(test, *reinterpret_cast<uint64_t*>(base + block * 3 + page) == 0x0123456789abcdefull,
 	      "automatic reuse changed a surviving alias");
+	CheckOk(test, UnmapAmmMemory(base + block * 4, block + page), "AMM unmap multiple sparse mappings");
+	CheckOk(test, UnmapAmmMemory(base + block * 4, block + page), "AMM repeat unmap after final release");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");
 	ExpectUnmapped(test, base);
@@ -2777,6 +2810,17 @@ void TestAutomaticMemoryFragmentedMapRollback() {
 	            "automatic allocation beyond donated capacity");
 	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
 	        "reuse both donations after final alias removal");
+	TestFailPhysicalMemoryUnmapAfter(1);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	const int unmap_result = KernelMunmap(base, block * 2);
+	TestSetGpuRangeCallback(nullptr);
+	CheckFailed(test, unmap_result, "unmap second backing failure");
+	ExpectUnmapped(test, base);
+	Check(test, Query(test, base + block).offset == static_cast<uint64_t>(second) &&
+	                g_gpu_range_events == std::vector<GpuRangeEvent>{
+	                    {false, base, block}, {false, base + block, block}, {true, base + block, block}},
+	      "failed strict unmap restored a freed prefix or lost the surviving GPU range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(first, block), "release first donation");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(gap, block), "release ordinary allocation");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(second, block), "release second donation");
