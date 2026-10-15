@@ -1050,7 +1050,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	{
+		KYTY_PROFILER_BLOCK("Draw::RefreshShaders");
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		return false;
@@ -1257,10 +1260,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	{
+		KYTY_PROFILER_BLOCK("Draw::GraphicsBindings");
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		KYTY_PROFILER_BLOCK("Draw::VertexIndex");
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1284,23 +1291,29 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
 	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
-	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
+	auto* deferred_pipeline = [&] {
+		KYTY_PROFILER_BLOCK("Draw::Pipeline");
+		return m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs, may_defer);
+	}();
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const auto rendering = [&] {
+		KYTY_PROFILER_BLOCK("Draw::AcquireTargets");
+		return AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
+		                            feedback_aspects, stages);
+	}();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory. Recorded through the recording thread when it runs.
 	const auto vk_buffer = buffer.Recorder();
+	KYTY_PROFILER_BLOCK("Draw::Record");
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1531,8 +1544,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	const bool target_operation = [&] {
+		KYTY_PROFILER_BLOCK("Draw::TargetOperations");
+		return ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+		       ResolveColorTargets(buffer, args.render_target_slice_offset);
+	}();
+	if (target_operation) {
 		ResetBindings();
 		return;
 	}
@@ -1601,7 +1618,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	const bool prepared = [&] {
+		KYTY_PROFILER_BLOCK("Draw::PrepareState");
+		return PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	}();
+	if (!prepared) {
 		ResetBindings();
 		return;
 	}
@@ -1620,8 +1641,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), args.base_vertex, 0, emit.vertex_offset,
 	               emit.first_instance, indirect);
 
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
+	{
+		KYTY_PROFILER_BLOCK("Draw::Execute");
+		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+		                    primitive_restart);
+	}
 	ResetBindings();
 }
 
