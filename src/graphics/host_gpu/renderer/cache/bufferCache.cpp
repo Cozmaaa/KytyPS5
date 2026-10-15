@@ -1141,10 +1141,39 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	return false;
 }
 
+bool ClearCheckWritersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CLEAR_CHECK_WRITERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::LastGpuWriter(uint64_t vaddr, uint64_t size, uint64_t& tag, uint64_t& tick) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	bool found = false;
+	auto it    = m_gpu_writers.lower_bound(vaddr + size);
+	for (uint32_t steps = 0; it != m_gpu_writers.begin() && steps < 4096; steps++) {
+		--it;
+		if (it->second.end > vaddr && (!found || it->second.tick >= tick)) {
+			tag   = it->second.tag;
+			tick  = it->second.tick;
+			found = true;
+		}
+	}
+	return found;
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
+		if (ClearCheckWritersEnabled()) {
+			if (m_gpu_writers.size() >= 65536) {
+				m_gpu_writers.clear();
+			}
+			m_gpu_writers[vaddr] = {vaddr + size, g_gpu_write_tag, m_scheduler.CurrentTick()};
+		}
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
 		const auto last  = Common::AlignUp(vaddr + size, WriteBitmapPage);
 		if (tracked && !m_bitmap_tracked.Contains(first, last - first)) {
@@ -1275,7 +1304,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	const auto tag = g_gpu_write_tag;
+	g_gpu_write_tag |= GpuWriteTagFill;
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	g_gpu_write_tag = tag;
 	dst->Fill(dst_offset, size, value);
 	RecordKnownFill(vaddr, size, value);
 }
@@ -1422,8 +1454,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	const auto tag = g_gpu_write_tag;
+	g_gpu_write_tag |= GpuWriteTagCopy;
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	g_gpu_write_tag = tag;
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

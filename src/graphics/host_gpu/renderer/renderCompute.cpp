@@ -450,6 +450,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	g_gpu_write_tag = sh_ctx.GetCs().cs_regs.data_addr;
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -753,6 +754,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
+	g_gpu_write_tag = cs_regs.cs_regs.data_addr;
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -249,9 +250,12 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		     " MB)\n",
 		     m_pressure_gc_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
 	}
-	// KYTY_GPU_CLEAR_CHECK=1: color clear checks of GPU-written metadata run on the GPU.
+	// Color clear checks of GPU-written metadata run on the GPU (KYTY_GPU_CLEAR_CHECK=0: on the CPU,
+	// draining the GPU). UFC 5 fight route, 2026-10-15, known fills on: the CPU check drained ~1.2
+	// times a frame (~7.5 ms each, a CMask a compute pass rewrites); on the GPU, 35.3 fps against
+	// 24.8 (3 rounds), DrawAuto 155 -> 8.5 us a call, screenshots the same.
 	if (const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
-	    value != nullptr && (value[0] == '1' || value[0] == '2' || value[0] == '3')) {
+	    value == nullptr || value[0] == '1' || value[0] == '2' || value[0] == '3') {
 		if (m_graphics.conditional_rendering_enabled) {
 			m_clear_check = std::make_unique<ColorClearCheck>(graphics, scheduler);
 		}
@@ -1373,10 +1377,43 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (!all_known && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		std::fill(known.begin(), known.end(), uint8_t {0});
-		if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+		const bool dirty = m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
+		if (dirty) {
 			downloaded_checks++;
 		}
+		// KYTY_CLEAR_CHECK_WRITERS=1: which GPU write the drain below waits for, and how long.
+		const auto reader = g_gpu_write_tag;
+		uint64_t   writer = 0, writer_tick = 0;
+		const bool writer_known =
+		    dirty && ClearCheckWritersEnabled() &&
+		    m_buffer_cache.LastGpuWriter(range.address, range.size, writer, writer_tick);
+		const auto started = std::chrono::steady_clock::now();
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		if (dirty && ClearCheckWritersEnabled()) {
+			static uint32_t logged = 0;
+			if (logged++ < 400) {
+				const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+				                    std::chrono::steady_clock::now() - started)
+				                    .count();
+				uint32_t known_count = 0;
+				for (const auto k: known) {
+					known_count += k;
+				}
+				LOGF("Clear check drain: %" PRId64 " us addr=0x%016" PRIx64 " size=0x%" PRIx64
+				     " slices=%u+%u/%u known=%u kind=%s format=%u %ux%u reader=%s 0x%016" PRIx64
+				     " writer=%s%s%s 0x%016" PRIx64 " ticks_ago=%" PRId64 "\n",
+				     static_cast<int64_t>(us), range.address, range.size, first, count, layers,
+				     known_count,
+				     desc.info.metadata.kind == ImageMetadataKind::Dcc ? "dcc" : "cmask",
+				     static_cast<uint32_t>(view.format), desc.info.extent.width,
+				     desc.info.extent.height, (reader & GpuWriteTagDraw) != 0 ? "draw" : "dispatch",
+				     reader & 0x0000ffffffffffffull,
+				     !writer_known ? "unknown" : (writer & GpuWriteTagDraw) != 0 ? "draw" : "dispatch",
+				     (writer & GpuWriteTagFill) != 0 ? "+fill" : "",
+				     (writer & GpuWriteTagCopy) != 0 ? "+copy" : "", writer & 0x0000ffffffffffffull,
+				     writer_known ? static_cast<int64_t>(current_tick - writer_tick) : int64_t {-1});
+			}
+		}
 	} else if (all_known) {
 		known_slices += count;
 	}

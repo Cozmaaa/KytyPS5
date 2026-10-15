@@ -32,6 +32,14 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 // Diagnostics for KYTY_READMEMORY_STACKS_COMPUTE (bufferCache.cpp).
 void SetReadMemoryInCompute(bool inside);
 
+// Diagnostics (KYTY_CLEAR_CHECK_WRITERS=1): what the GPU thread is translating, recorded with
+// each GPU write (BufferCache::LastGpuWriter). The guest shader address, with these flags.
+inline constexpr uint64_t GpuWriteTagDraw = uint64_t {1} << 63u;
+inline constexpr uint64_t GpuWriteTagFill = uint64_t {1} << 62u;
+inline constexpr uint64_t GpuWriteTagCopy = uint64_t {1} << 61u;
+inline thread_local uint64_t g_gpu_write_tag = 0;
+bool ClearCheckWritersEnabled();
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -116,6 +124,9 @@ public:
 	// check of an unchanged slice finds nothing new, so it is skipped.
 	void               MarkClearChecked(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsClearChecked(uint64_t vaddr, uint64_t size);
+	// KYTY_CLEAR_CHECK_WRITERS=1: the tag (g_gpu_write_tag) and tick of the latest GPU write that
+	// overlaps the range, false when none is recorded.
+	bool LastGpuWriter(uint64_t vaddr, uint64_t size, uint64_t& tag, uint64_t& tick);
 	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
 	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
 	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
@@ -239,6 +250,13 @@ private:
 	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	// MarkClearChecked ranges: begin -> end. Guarded and erased with m_known_fills.
 	std::map<uint64_t, uint64_t>                        m_clear_checked;
+	// KYTY_CLEAR_CHECK_WRITERS=1: GPU writes, begin -> (end, tag, tick); newest wins on overlap.
+	struct GpuWriter {
+		uint64_t end  = 0;
+		uint64_t tag  = 0;
+		uint64_t tick = 0;
+	};
+	std::map<uint64_t, GpuWriter>                       m_gpu_writers;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against
