@@ -1,5 +1,6 @@
 #include "common/archive.h"
 #include "common/common.h"
+#include "common/cpuAffinity.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -136,6 +137,8 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --cpu-placement <true|false>         X3D mode: V-Cache CCD, own cores and priorities for\n"
+	         "                                       the emulator's hot threads (default true).\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
@@ -486,6 +489,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--cpu-placement") {
+			bool enabled = true;
+			if (!ParseBool(value, enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			Common::SetCpuPlacementEnabled(enabled);
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

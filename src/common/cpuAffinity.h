@@ -3,13 +3,42 @@
 
 namespace Common {
 
-// On a CPU with cores of different speeds (Intel 12th-14th gen and later hybrid designs), keeps
-// the calling thread on the fastest cores: the emulator's GPU thread is its bottleneck, and on an
-// efficiency core it ran ~1.7x slower per operation (i7-13700F on Linux, 2026-10-06). Windows:
-// CPU sets of the highest efficiency class (a scheduler preference). Linux: the cores with the
-// highest maximum frequency. A no-op on CPUs whose cores are all alike, on macOS, and with
-// KYTY_PCORE_AFFINITY=0. `name` is for the log line.
-void PreferPerformanceCores(const char* name);
+// Where the emulator's own threads run, and at what priority (KYTY_X3D, on by default).
+//
+// The GPU thread is the emulator's bottleneck, and the threads feeding it come next. The
+// processor's layout decides the placement:
+// - Ryzen X3D with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D): only one CCD has the stacked
+//   L3. The emulator, guest threads included, is kept on that CCD; background work (pipeline
+//   compilation, shader translation, file streaming, disk cache writes) goes to the other one.
+// - Hybrid CPUs (Intel 12th gen and later): the critical and high threads stay on the
+//   performance cores (on an efficiency core the GPU thread ran ~1.7x slower per operation,
+//   i7-13700F, 2026-10-06), background work prefers the efficiency cores.
+// - Every CPU with enough cores, single-CCD X3D (7800X3D, 9800X3D) included: each critical
+//   thread gets a physical core to itself, both SMT siblings, which no other emulator or guest
+//   thread is scheduled on (KYTY_X3D_RESERVE cores, default 2; 0 turns this off).
+//
+// Windows uses CPU sets (a strong scheduler preference that ends with the process; nothing
+// system-wide changes) and thread priorities. Linux pins the critical and high threads to the
+// fast cores only. macOS: nothing. KYTY_X3D=0 (or the older KYTY_PCORE_AFFINITY=0) turns all of
+// it off. "CPU placement:" log lines say what was done.
+enum class ThreadClass {
+	Critical,   // GPU thread, Vulkan recording thread: a dedicated core, highest priority.
+	High,       // Threads the critical ones wait on: fast cores, above-normal priority.
+	Background, // Throughput work: the other CCD or efficiency cores when there are any.
+	Low,        // Background placement, below-normal priority.
+};
+
+// --cpu-placement false (the launcher's X3D mode checkbox): the same as KYTY_X3D=0. Called while
+// parsing the command line, before any thread is placed.
+void SetCpuPlacementEnabled(bool enabled);
+
+// Applies the placement for `cls` to the calling thread. `name` is for the log line.
+void PlaceCurrentThread(ThreadClass cls, const char* name);
+
+// Reads the topology, reserves the critical cores and sets the process's default placement
+// (which guest threads and every untagged thread follow). Idempotent; PlaceCurrentThread calls it
+// too. Logs the topology once.
+void InitCpuPlacement();
 
 } // namespace Common
 

@@ -185,6 +185,12 @@
           <property name="text"><string>Bindless textures (experimental)</string></property>
          </widget>
         </item>
+        <item row="11" column="1">
+         <widget class="QCheckBox" name="checkBox_cpu_placement">
+          <property name="toolTip"><string>Keeps the emulator on the V-Cache CCD of dual-CCD Ryzen X3D processors, gives the GPU and Vulkan recording threads a core each, and raises the priority of the threads they wait on.</string></property>
+          <property name="text"><string>X3D mode (CPU placement)</string></property>
+         </widget>
+        </item>
         <item row="10" column="0">
          <widget class="QLabel" name="label_skip_shaders">
           <property name="text"><string>Skip shaders:</string></property>

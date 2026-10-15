@@ -252,6 +252,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.bindless_images_enabled) {
 		args << "--bindless";
 	}
+	args << "--cpu-placement" << BoolArg(info.cpu_placement_enabled);
 	if (!info.skip_shader_hashes.isEmpty()) {
 		args << "--skip-shaders" << info.skip_shader_hashes;
 	}

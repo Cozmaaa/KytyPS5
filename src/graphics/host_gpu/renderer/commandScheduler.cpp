@@ -378,6 +378,7 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "Vulkan priority operations thread");
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -579,6 +580,7 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "Vulkan queue submit thread");
 	for (;;) {
 		SubmitJob job;
 		{
@@ -670,7 +672,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
-	Common::PreferPerformanceCores("Vulkan recording thread");
+	Common::PlaceCurrentThread(Common::ThreadClass::Critical, "Vulkan recording thread");
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;

@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -853,6 +854,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "present thread");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 

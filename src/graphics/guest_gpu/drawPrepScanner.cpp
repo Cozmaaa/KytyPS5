@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/drawPrepScanner.h"
 
+#include "common/cpuAffinity.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -75,6 +76,7 @@ void DrawPrepScanner::EnqueueReset(uint32_t queue) {
 
 void DrawPrepScanner::Run() {
 	KYTY_PROFILER_THREAD("Thread_DrawPrep");
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "draw preparation scanner");
 	// The clean-backing reads (TryReadGpuCleanBacking) answer "maybe GPU-written" on any other
 	// thread; a read delegate checks the buffer cache's GPU-dirty ranges under their shared lock,
 	// which the GPU thread holds exclusively whenever it changes them.

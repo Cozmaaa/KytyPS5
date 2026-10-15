@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "shaderCacheVersion.h"
@@ -957,6 +958,7 @@ void Store::Flush() {
 }
 
 void Store::WriterLoop() {
+	Common::PlaceCurrentThread(Common::ThreadClass::Low, "shader disk cache writer");
 	std::unique_lock lock(m_mutex);
 	for (;;) {
 		m_wake.wait(lock, [this] { return m_stop || !m_queue.empty(); });

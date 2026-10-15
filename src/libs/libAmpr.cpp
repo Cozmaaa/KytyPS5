@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/cpuAffinity.h"
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -1659,6 +1660,7 @@ public:
 
 private:
 	void Run() {
+		Common::PlaceCurrentThread(Common::ThreadClass::Background, "AMPR file streaming");
 		for (;;) {
 			PendingSubmission submission;
 			{

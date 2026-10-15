@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -196,6 +197,8 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	// Before the guest's threads start: they follow the process default placement.
+	Common::InitCpuPlacement();
 	std::string title_id;
 	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));

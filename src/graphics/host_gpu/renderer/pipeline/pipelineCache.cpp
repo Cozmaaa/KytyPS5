@@ -581,6 +581,7 @@ public:
 private:
 	void Run() {
 		KYTY_PROFILER_THREAD("PipelineCompiler");
+		Common::PlaceCurrentThread(Common::ThreadClass::Background, "pipeline compiler");
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
 			{
@@ -676,6 +677,7 @@ public:
 private:
 	void Run() {
 		KYTY_PROFILER_THREAD("ShaderTranslator");
+		Common::PlaceCurrentThread(Common::ThreadClass::Background, "shader translator");
 		for (;;) {
 			std::shared_ptr<TranslationJob> job;
 			{
@@ -782,7 +784,7 @@ private:
 
 	void Run() {
 		KYTY_PROFILER_THREAD("StagePrep");
-		Common::PreferPerformanceCores("stage preparation helper");
+		Common::PlaceCurrentThread(Common::ThreadClass::High, "stage preparation helper");
 		Libs::LibKernel::Memory::SetGpuReadDelegate(true);
 		auto last_job = std::chrono::steady_clock::now();
 		while (!m_stop_flag.load(std::memory_order_acquire)) {
