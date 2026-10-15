@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -957,6 +958,15 @@ struct PipelineCache::ProgramCache {
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(spirv.size()), options.wave_size);
+		}
+		if (ShaderRecompiler::IR::TableCensusEnabled()) {
+			const auto census     = ShaderRecompiler::IR::TableEligibility(source.resource_plan);
+			program.table_refusal = static_cast<uint8_t>(census.refusal);
+			program.table_slots   = census.slots;
+			program.table_global  = census.global;
+			LOGF("Table census program: %s 0x%016" PRIx64 " %s slots=%u global=%d\n", stage_name,
+			     options.shader_hash, ShaderRecompiler::IR::TableRefusalName(census.refusal),
+			     static_cast<unsigned>(census.slots), census.global ? 1 : 0);
 		}
 		source.permutations.push_back({
 		    .specialization = source.specialization,

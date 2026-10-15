@@ -605,6 +605,12 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	// Table mode census (KYTY_TABLE_CENSUS=1, BindingLayout.h: TableEligibility), set when the
+	// permutation is registered; not serialized. A TableRefusal, the SRT slot count and whether
+	// it reads flat or global memory.
+	uint8_t                       table_refusal       = 0;
+	uint16_t                      table_slots         = 0;
+	bool                          table_global        = false;
 };
 
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.

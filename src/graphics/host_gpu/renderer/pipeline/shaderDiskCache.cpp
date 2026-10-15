@@ -380,7 +380,8 @@ static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
 static_assert(sizeof(IR::BindingLayout) == 72);
-static_assert(sizeof(IR::CompiledShaderInfo) == 304);
+// (table_refusal, table_slots and table_global are not serialized: AddPermutation sets them.)
+static_assert(sizeof(IR::CompiledShaderInfo) == 312);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);

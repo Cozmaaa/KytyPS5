@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -39,6 +40,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -48,7 +50,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <fmt/format.h>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1021,6 +1025,163 @@ static void LogDrawCensus(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                  state.ps_active ? 1 : 0);
 }
 
+// KYTY_TABLE_CENSUS=1: which DrawIndex calls the Demon's Souls fork's table mode could take, and
+// what they cost on this thread now (table-mode-port-plan.md, step 0). Each draw is timed whole and
+// classed by its programs' TableEligibility; every 120 frames one summary of per-frame averages.
+// GPU thread only (DrawIndex and DrawAuto hold the renderer's lock).
+class TableDrawCensus {
+public:
+	enum Class : uint32_t {
+		Skipped,     // no draw (empty, target operation, no vertex shader, not prepared)
+		Stages,      // tessellation or a geometry stage
+		VsRefused,
+		PsRefused,
+		EligibleNew, // eligible, a program pair not drawn in an earlier frame
+		EligibleRepeat,
+		Auto,        // DrawAuto (not classed)
+		Classes
+	};
+	static constexpr std::array<const char*, Classes> Names {
+	    "skipped", "stages", "vs-refused", "ps-refused", "eligible-new", "eligible-repeat", "auto"};
+
+	explicit TableDrawCensus(CommandBuffer& buffer)
+	    : m_buffer(buffer), m_start(TableCensusEnabled() ? Clock::now() : Clock::time_point {}) {}
+	~TableDrawCensus() {
+		if (TableCensusEnabled()) {
+			Record(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - m_start).count());
+		}
+	}
+	KYTY_CLASS_NO_COPY(TableDrawCensus);
+
+	static bool TableCensusEnabled() { return ShaderRecompiler::IR::TableCensusEnabled(); }
+
+	void SetClass(Class value) { m_class = value; }
+	// After PrepareDrawRenderState: classes the draw by its programs.
+	void Classify(const DrawRenderState& state) {
+		if (!TableCensusEnabled()) {
+			return;
+		}
+		using ShaderRecompiler::IR::TableRefusal;
+		const auto* vs = state.vertex_info[0].stage.program;
+		const auto* ps = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+		if (state.programs.VertexStageCount() != 1 || vs == nullptr) {
+			m_class = Stages;
+			return;
+		}
+		if (vs->table_refusal != static_cast<uint8_t>(TableRefusal::Eligible)) {
+			m_class   = VsRefused;
+			m_refusal = vs->table_refusal;
+			return;
+		}
+		if (ps != nullptr && ps->table_refusal != static_cast<uint8_t>(TableRefusal::Eligible)) {
+			m_class   = PsRefused;
+			m_refusal = ps->table_refusal;
+			return;
+		}
+		m_slots  = vs->table_slots + (ps != nullptr ? ps->table_slots : 0u);
+		m_global = vs->table_global || (ps != nullptr && ps->table_global);
+		m_pair   = reinterpret_cast<uint64_t>(vs) * 0x9e3779b97f4a7c15ull ^ reinterpret_cast<uint64_t>(ps);
+		m_class  = EligibleNew;
+	}
+
+private:
+	using Clock = std::chrono::steady_clock;
+	struct Window {
+		uint64_t                                    first_frame = UINT64_MAX;
+		std::array<uint64_t, Classes>               count {};
+		std::array<uint64_t, Classes>               ns {};
+		std::array<uint64_t, 32>                    vs_refusals {}, ps_refusals {};
+		uint64_t                                    eligible_slots  = 0;
+		uint64_t                                    eligible_global = 0;
+		// Eligible pair -> the frames it was first and last drawn in.
+		std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pairs;
+		uint64_t                                    distinct_pairs = 0; // summed per frame
+	};
+	static Window& State() {
+		static Window window;
+		return window;
+	}
+
+	void Record(int64_t ns) {
+		auto&      w     = State();
+		const auto frame = static_cast<uint64_t>(m_buffer.GetContext().GetGpu().GetFrameNum());
+		if (w.first_frame == UINT64_MAX) {
+			w.first_frame = frame;
+		}
+		if (m_class == EligibleNew) {
+			auto [it, fresh] = w.pairs.try_emplace(m_pair, frame, frame);
+			if (it->second.first < frame) {
+				m_class = EligibleRepeat;
+			}
+			if (fresh || it->second.second != frame) {
+				w.distinct_pairs++;
+				it->second.second = frame;
+			}
+			w.eligible_slots += m_slots;
+			w.eligible_global += m_global ? 1u : 0u;
+		}
+		w.count[m_class]++;
+		w.ns[m_class] += static_cast<uint64_t>(std::max<int64_t>(ns, 0));
+		if (m_class == VsRefused) {
+			w.vs_refusals[m_refusal & 31u]++;
+		} else if (m_class == PsRefused) {
+			w.ps_refusals[m_refusal & 31u]++;
+		}
+		if (frame < w.first_frame + 120) {
+			return;
+		}
+		const auto frames = static_cast<double>(frame - w.first_frame);
+		uint64_t   drawn = 0, drawn_ns = 0;
+		for (uint32_t c = Stages; c < Classes; c++) {
+			drawn += w.count[c];
+			drawn_ns += w.ns[c];
+		}
+		const auto eligible    = w.count[EligibleNew] + w.count[EligibleRepeat];
+		const auto eligible_ns = w.ns[EligibleNew] + w.ns[EligibleRepeat];
+		std::string line = fmt::format(
+		    "Table census: frames {}-{}: {:.0f} drawn/frame ({:.2f} ms/frame, {:.0f} ns/draw), eligible "
+		    "{:.1f}% of draws ({:.1f}% repeat), {:.2f} ms/frame ({:.0f} ns/draw), {:.1f} pairs/frame, "
+		    "{:.1f} slots/draw, global {:.1f}%;",
+		    w.first_frame, frame, static_cast<double>(drawn) / frames, static_cast<double>(drawn_ns) / frames / 1e6,
+		    drawn != 0 ? static_cast<double>(drawn_ns) / static_cast<double>(drawn) : 0.0,
+		    drawn != 0 ? 100.0 * static_cast<double>(eligible) / static_cast<double>(drawn) : 0.0,
+		    drawn != 0 ? 100.0 * static_cast<double>(w.count[EligibleRepeat]) / static_cast<double>(drawn) : 0.0,
+		    static_cast<double>(eligible_ns) / frames / 1e6,
+		    eligible != 0 ? static_cast<double>(eligible_ns) / static_cast<double>(eligible) : 0.0,
+		    static_cast<double>(w.distinct_pairs) / frames,
+		    eligible != 0 ? static_cast<double>(w.eligible_slots) / static_cast<double>(eligible) : 0.0,
+		    eligible != 0 ? 100.0 * static_cast<double>(w.eligible_global) / static_cast<double>(eligible) : 0.0);
+		for (uint32_t c = 0; c < Classes; c++) {
+			line += fmt::format(" {}={:.0f}/{:.0f}ns", Names[c], static_cast<double>(w.count[c]) / frames,
+			                    w.count[c] != 0 ? static_cast<double>(w.ns[c]) / static_cast<double>(w.count[c]) : 0.0);
+		}
+		for (const auto& [label, refusals]:
+		     std::array {std::pair {"vs", &w.vs_refusals}, std::pair {"ps", &w.ps_refusals}}) {
+			for (uint32_t r = 0; r < refusals->size(); r++) {
+				if ((*refusals)[r] != 0) {
+					line += fmt::format(" {}:{}={:.1f}", label,
+					                    ShaderRecompiler::IR::TableRefusalName(
+					                        static_cast<ShaderRecompiler::IR::TableRefusal>(r)),
+					                    static_cast<double>((*refusals)[r]) / frames);
+				}
+			}
+		}
+		LOGF("%s\n", line.c_str());
+		auto pairs    = std::move(w.pairs);
+		w             = {};
+		w.first_frame = frame;
+		w.pairs       = std::move(pairs);
+	}
+
+	CommandBuffer&    m_buffer;
+	Clock::time_point m_start;
+	Class             m_class   = Skipped;
+	uint8_t           m_refusal = 0;
+	uint32_t          m_slots   = 0;
+	bool              m_global  = false;
+	uint64_t          m_pair    = 0;
+};
+
 // Diagnostics: the draw parameters of the watched shader's draws in the watched frame (see
 // InWatchedShaderFrame); each line precedes that draw's WatchShader bindings.
 void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
@@ -1526,6 +1687,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	TableDrawCensus census(buffer);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1626,6 +1788,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	census.Classify(state);
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
@@ -1652,6 +1815,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	TableDrawCensus census(buffer);
+	census.SetClass(TableDrawCensus::Auto);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
