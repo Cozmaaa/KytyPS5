@@ -342,11 +342,19 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
-bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+bool BufferCache::WriteClean(uint64_t vaddr, const void* source, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	// The source is often guest memory (a WRITE_DATA payload inside the command buffer), which may
+	// sit on a page protected as GPU-written. Copied here, before any lock: TryWriteBacking copies
+	// under the backing store's mutex, and a fault there re-entered it through the fault handler's
+	// readback (WriteBacking), which threw resource_deadlock_would_occur inside the exception
+	// handler and aborted the process (UFC 5, ~20 % of fight loads, 2026-10-15).
+	std::vector<uint8_t> copy(static_cast<size_t>(size));
+	std::memcpy(copy.data(), source, copy.size());
+	const void* data = copy.data();
 	{
 		// A download publishes the GPU's older value of these bytes when it lands.
 		std::shared_lock lock(m_dirty_ranges_mutex);
@@ -380,6 +388,18 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+// KYTY_READMEMORY_STACKS_COMPUTE=1: only the readbacks asked for while a dispatch resolves its
+// compute program (see SetReadMemoryInCompute).
+static const bool g_readmemory_stacks_compute_only = [] {
+	const char* value = std::getenv("KYTY_READMEMORY_STACKS_COMPUTE");
+	return value != nullptr && value[0] == '1';
+}();
+static thread_local bool t_readmemory_in_compute = false;
+
+void SetReadMemoryInCompute(bool inside) {
+	t_readmemory_in_compute = inside;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -389,6 +409,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	// Diagnostics: KYTY_READMEMORY_STACKS=N logs the host stacks of the first N readbacks the
+	// GPU thread itself asks for (each drains the GPU).
+	if (from_gpu_thread) {
+		static const uint64_t stacks = [] {
+			const char* value = std::getenv("KYTY_READMEMORY_STACKS");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0};
+		}();
+		static uint64_t logged = 0;
+		if (logged < stacks && (!g_readmemory_stacks_compute_only || t_readmemory_in_compute)) {
+			logged++;
+			LOGF("ReadMemory on the GPU thread: addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n%s", vaddr,
+			     size, Common::HostBacktrace().c_str());
+		}
+	}
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(

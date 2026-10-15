@@ -525,8 +525,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderProgram compute_program;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		SetReadMemoryInCompute(true);
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+		SetReadMemoryInCompute(false);
 	}
 	if (!compute_program) {
 		char groups[48];

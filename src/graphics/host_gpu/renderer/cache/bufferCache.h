@@ -29,6 +29,9 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// Diagnostics for KYTY_READMEMORY_STACKS_COMPUTE (bufferCache.cpp).
+void SetReadMemoryInCompute(bool inside);
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;

@@ -1,4 +1,6 @@
 #include "common/archive.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/common.h"
 #include "common/cpuAffinity.h"
 #include "common/dateTime.h"
@@ -10,7 +12,10 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <charconv>
+#include <csignal>
+#include <exception>
 #include <cstdio>
 #include <filesystem>
 #include <string_view>
@@ -526,7 +531,37 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// An abort() or std::terminate (an uncaught exception, a failed library assertion) ended the
+// process with only a WER event: no message and no stack, while the log lost its tail. Name the
+// caller and flush the log first.
+static void ReportAbort(const char* what) {
+	static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+	if (reported.test_and_set()) {
+		return;
+	}
+	Log::WriteFatal(fmt::format("--- {} ---\n{}", what, Common::HostBacktrace()));
+}
+
+static void InstallAbortReport() {
+	std::signal(SIGABRT, [](int) { ReportAbort("abort()"); });
+	std::set_terminate([] {
+		const char* reason = "std::terminate";
+		if (auto current = std::current_exception(); current != nullptr) {
+			try {
+				std::rethrow_exception(current);
+			} catch (const std::exception& e) {
+				Log::WriteFatal(fmt::format("Uncaught exception: {}\n", e.what()));
+			} catch (...) {
+				reason = "std::terminate (unknown exception)";
+			}
+		}
+		ReportAbort(reason);
+		std::abort();
+	});
+}
+
 static int Main(int argc, char* argv[]) {
+	InstallAbortReport();
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
