@@ -12,6 +12,48 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Large pages for guest code (KYTY_LARGE_PAGES=1): the 2 MiB-aligned middle of each module's
+// executable segment is committed with large pages, so the game's code (UFC 5's eboot: ~110 MB)
+// takes a few dozen TLB entries instead of tens of thousands. Only code: everything else is
+// protected 4 KiB at a time by the GPU page tracker, which a large page cannot follow, and guest
+// mappings of direct memory are views of one section at guest-chosen 16 KiB granularity. Windows
+// needs the "Lock pages in memory" right (secpol.msc: Local Policies > User Rights Assignment)
+// and physically contiguous free memory; without either, normal pages are used.
+// Returns the large-page size, or 0 when off or unavailable.
+static uint64_t GuestLargePageSize() {
+	static const uint64_t size = []() -> uint64_t {
+		const char* value = std::getenv("KYTY_LARGE_PAGES");
+		if (value == nullptr || value[0] != '1') {
+			return 0;
+		}
+		bool   granted = false;
+		HANDLE token   = nullptr;
+		if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+			TOKEN_PRIVILEGES privileges {};
+			privileges.PrivilegeCount           = 1;
+			privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+			// AdjustTokenPrivileges succeeds without granting: ERROR_NOT_ALL_ASSIGNED says so.
+			granted = LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege",
+			                                &privileges.Privileges[0].Luid) != 0 &&
+			          AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) != 0 &&
+			          GetLastError() == ERROR_SUCCESS;
+			CloseHandle(token);
+		}
+		const uint64_t minimum = GetLargePageMinimum();
+		if (!granted || minimum == 0) {
+			LOGF("Large pages: unavailable (%s), guest code uses normal pages\n",
+			     granted ? "no large-page support"
+			             : "the account lacks the \"Lock pages in memory\" right");
+			return 0;
+		}
+		LOGF("Large pages: on, %" PRIu64 " KiB pages for guest code\n", minimum >> 10u);
+		return minimum;
+	}();
+	return size;
+}
+#endif
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	if (UINT64_MAX - base < range_size || candidate < base) {
@@ -1047,7 +1089,10 @@ public:
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
-	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// [large_vaddr, large_vaddr + large_size): the part that may use large pages (guest code, see
+	// GuestLargePageSize); only its large-page-aligned middle does.
+	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, uint64_t large_vaddr = 0,
+	            uint64_t large_size = 0) {
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
@@ -1057,19 +1102,73 @@ public:
 		                           : VirtualMemory::Mode::ReadWrite;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-		                          GetProtect(host_mode), nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
-			if (ptr != nullptr) {
-				VirtualFree(ptr, 0, MEM_RELEASE);
-			}
-			AddFreeUnlocked(vaddr, size);
-			return false;
+		const auto end   = vaddr + size;
+		auto       large = GuestLargePageSize();
+		uint64_t   large_begin = 0, large_end = 0;
+		if (large != 0 && large_size != 0 && host_mode == VirtualMemory::Mode::ExecuteReadWrite) {
+			large_begin = AlignUp(std::max(large_vaddr, vaddr), large);
+			large_end   = AlignDown(std::min(large_vaddr + large_size, end), large);
 		}
-		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+		// Placeholders split into [vaddr, large_begin), [large_begin, large_end), [large_end, end).
+		std::vector<std::pair<uint64_t, uint64_t>> parts;
+		if (large_begin != 0 && large_end > large_begin &&
+		    (large_begin == vaddr || SplitPlaceholderUnlocked(vaddr, large_begin - vaddr)) &&
+		    (large_end == end || SplitPlaceholderUnlocked(large_begin, large_end - large_begin))) {
+			for (const auto& [b, e]: {std::pair {vaddr, large_begin}, std::pair {large_begin, large_end},
+			                          std::pair {large_end, end}}) {
+				if (e > b) {
+					parts.emplace_back(b, e - b);
+				}
+			}
+		} else {
+			large_begin = large_end = 0;
+			parts.emplace_back(vaddr, size);
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> committed;
+		for (const auto& [part, part_size]: parts) {
+			void* ptr = nullptr;
+			if (part == large_begin) {
+				ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(part), part_size,
+				                    MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES | MEM_REPLACE_PLACEHOLDER,
+				                    PAGE_EXECUTE_READWRITE, nullptr, 0);
+				if (reinterpret_cast<uint64_t>(ptr) == part) {
+					m_large.emplace(part, part_size);
+					LOGF("Large pages: guest code 0x%016" PRIx64 "-0x%016" PRIx64 " (%" PRIu64
+					     " MiB)\n",
+					     part, part + part_size, part_size >> 20u);
+				} else {
+					LOGF("Large pages: guest code 0x%016" PRIx64 " fell back to normal pages (error %u)\n",
+					     part, static_cast<unsigned>(GetLastError()));
+					ptr = nullptr;
+				}
+			}
+			if (ptr == nullptr) {
+				ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(part), part_size,
+				                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+				                    GetProtect(host_mode), nullptr, 0);
+			}
+			if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != part) {
+				if (ptr != nullptr) {
+					VirtualFree(ptr, 0, MEM_RELEASE);
+				}
+				// Undo the parts already committed; the placeholders join again.
+				for (const auto& [done, done_size]: committed) {
+					EXIT_IF(VirtualFree(reinterpret_cast<void*>(done), done_size,
+					                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
+					EXIT_IF(!RemoveMappedUnlocked(done, done_size, MappingType::Private));
+					m_large.erase(done);
+				}
+				EXIT_IF(parts.size() > 1 && !CoalescePlaceholders(vaddr, size));
+				AddFreeUnlocked(vaddr, size);
+				return false;
+			}
+			EXIT_IF(!AddMappedUnlocked(part, part_size, MappingType::Private));
+			committed.emplace_back(part, part_size);
+		}
 		return true;
 #else
+		(void)large_vaddr;
+		(void)large_size;
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
 			return true;
@@ -1100,6 +1199,7 @@ public:
 		for (const auto& [region_vaddr, region_size]: regions) {
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
 			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
+			m_large.erase(region_vaddr);
 		}
 		// ReleaseCommitted also publishes the aggregate span as one logical free range.
 		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
@@ -1180,13 +1280,34 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (range_start >= range_end) {
+				continue;
+			}
+			if (m_large.count(region.vaddr) != 0) {
+				// Large-page guest code stays read-write-execute: a large page cannot take a
+				// protection 16 KiB at a time. The guest-visible protection is kept separately.
+				if (mode != VirtualMemory::Mode::ExecuteReadWrite && !m_large_protect_logged) {
+					m_large_protect_logged = true;
+					LOGF("Large pages: protection 0x%08" PRIx32 " at 0x%016" PRIx64
+					     " not applied to large-page guest code\n",
+					     static_cast<uint32_t>(mode), range_start);
+				}
+				continue;
+			}
+			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
 		}
 		return true;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Splits off [vaddr, vaddr + size) of a free placeholder as a placeholder of its own.
+	static bool SplitPlaceholderUnlocked(uint64_t vaddr, uint64_t size) {
+		return VirtualFree(reinterpret_cast<void*>(vaddr), size,
+		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
+	}
+#endif
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
 		auto it = FindContaining(vaddr, size);
@@ -1550,6 +1671,9 @@ private:
 	std::mutex                                 m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Private regions committed with large pages (start -> size); see GuestLargePageSize.
+	std::map<uint64_t, uint64_t>                m_large;
+	bool                                        m_large_protect_logged = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;

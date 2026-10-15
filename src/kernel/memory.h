@@ -199,8 +199,11 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
 int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* output,
                                                 size_t                      output_size);
 
+// [code_offset, code_offset + code_size): the module's executable segment, relative to the
+// allocation, which may use large pages (KYTY_LARGE_PAGES=1).
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
-                               Common::VirtualMemory::Mode mode, const char* name);
+                               Common::VirtualMemory::Mode mode, const char* name,
+                               uint64_t code_offset = 0, uint64_t code_size = 0);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,

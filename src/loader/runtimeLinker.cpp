@@ -1798,9 +1798,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
 	}
 
+	// The largest executable segment may use large pages (KYTY_LARGE_PAGES=1).
+	uint64_t code_offset = 0;
+	uint64_t code_size   = 0;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0 && phdr[i].p_memsz > code_size &&
+		    phdr[i].p_vaddr < program->base_size_aligned) {
+			code_offset = phdr[i].p_vaddr;
+			code_size   = std::min<uint64_t>(phdr[i].p_memsz, program->base_size_aligned - phdr[i].p_vaddr);
+		}
+	}
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    Common::PathToString(program->file_name.filename()).c_str());
+	    Common::PathToString(program->file_name.filename()).c_str(), code_offset, code_size);
 	EXIT_IF(program->base_vaddr == 0);
 
 	if (patch_guest_instructions) {

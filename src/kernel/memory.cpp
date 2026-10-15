@@ -3954,7 +3954,8 @@ static std::vector<VirtualRanges::Range> RequireGuestRuntimeMemory(uint64_t vadd
 
 static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
                                            VirtualMemory::Mode mode, const char* name,
-                                           VirtualRangeType type, bool fixed) {
+                                           VirtualRangeType type, bool fixed,
+                                           uint64_t code_offset = 0, uint64_t code_size = 0) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	constexpr uint64_t GuestPageSize = 0x4000;
@@ -3969,7 +3970,8 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	UnmapGpuRange(vaddr, mapped_size);
-	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
+	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode,
+	                                   code_size != 0 ? vaddr + code_offset : 0, code_size)) {
 		return 0;
 	}
 	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
@@ -3981,8 +3983,9 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 }
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
-                               const char* name) {
-	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+                               const char* name, uint64_t code_offset, uint64_t code_size) {
+	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false,
+	                                  code_offset, code_size);
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
