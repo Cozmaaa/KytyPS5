@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/cache/hostImport.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -253,6 +254,23 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	                           g_bounded_buffer_writes;
 	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
 	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	// KYTY_HOST_IMPORT=1 (HostImport): a read-only range no GPU work wrote reads the guest's own
+	// bytes, without the buffer cache's sync and upload. A formatted range qualifies only when no
+	// image starts there: those are synchronized from the image (SynchronizeBufferFromImage).
+	if (auto* importer = HostImport::Get(context.GetGraphics());
+	    importer != nullptr && !resource.written && size <= HostImport::MaxBytes()) {
+		KYTY_PROFILER_BLOCK("Bind::HostImport");
+		const auto* backing = Libs::LibKernel::Memory::FindGpuCleanBacking(address, size);
+		vk::Buffer  imported;
+		uint64_t    imported_offset = 0;
+		if (backing != nullptr &&
+		    (!resource.formatted || !context.GetTextureCache().FindImageFromRange(address, size)) &&
+		    importer->Find(backing, size, imported, imported_offset)) {
+			const auto aligned = Common::AlignDown(imported_offset, alignment);
+			buffer_offset      = static_cast<uint32_t>(imported_offset - aligned);
+			return {imported, aligned, size + buffer_offset};
+		}
+	}
 	// Unbounded writes through a large range: the shader marks the pages it writes in the GPU
 	// write bitmap, and only those are downloaded (BufferCache::ObtainBufferTracked).
 	const bool tracked = track_writes && resource.written && !bounded_write &&

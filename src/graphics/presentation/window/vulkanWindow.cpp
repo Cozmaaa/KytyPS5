@@ -519,6 +519,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.external_memory_host_enabled =
+	    HasExtension(device_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 
@@ -1267,7 +1269,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
