@@ -1145,15 +1145,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		// Any GPU write ends what a recorded fill says about these bytes.
-		if (!m_known_fills.empty()) {
-			auto it = m_known_fills.upper_bound(vaddr);
-			if (it != m_known_fills.begin() && std::prev(it)->second.first > vaddr) {
-				--it;
-			}
-			while (it != m_known_fills.end() && it->first < vaddr + size) {
-				it = m_known_fills.erase(it);
-			}
-		}
+		EraseKnownFillsLocked(vaddr, size);
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
@@ -1280,6 +1272,22 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 	if (m_known_fills.size() >= 8192) {
 		m_known_fills.clear();
 	}
+	EraseKnownFillsLocked(vaddr, size);
+	m_known_fills.emplace(vaddr, std::pair {vaddr + size, value});
+}
+
+void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	EraseKnownFillsLocked(vaddr, size);
+}
+
+void BufferCache::EraseKnownFillsLocked(uint64_t vaddr, uint64_t size) {
+	if (m_known_fills.empty()) {
+		return;
+	}
 	auto it = m_known_fills.upper_bound(vaddr);
 	if (it != m_known_fills.begin() && std::prev(it)->second.first > vaddr) {
 		--it;
@@ -1287,7 +1295,6 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 	while (it != m_known_fills.end() && it->first < vaddr + size) {
 		it = m_known_fills.erase(it);
 	}
-	m_known_fills.emplace(vaddr, std::pair {vaddr + size, value});
 }
 
 bool BufferCache::TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) {

@@ -1697,6 +1697,11 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
 	image.ClearBufferModified();
+	// Image writes bypass BufferCache::MarkGpuWritten, so a fill recorded over memory this image
+	// now reuses would otherwise still answer color-metadata clear checks with stale bytes.
+	if (!image.info.data.Empty()) {
+		m_buffer_cache.ForgetKnownFills(image.info.data.address, image.info.data.size);
+	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}

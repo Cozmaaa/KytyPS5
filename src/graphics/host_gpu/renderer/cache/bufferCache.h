@@ -105,6 +105,9 @@ public:
 	// TryKnownFill answers only for a range wholly covered by such fills of one value.
 	void               RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	[[nodiscard]] bool TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value);
+	// Drops the known fills a GPU write outside the buffer path overlaps (an image write: render
+	// target, storage image, image copy or clear). Those never reach MarkGpuWritten.
+	void ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
 	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
 	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
@@ -225,6 +228,7 @@ private:
 	// Known fills (RecordKnownFill): begin -> (end, value), non-overlapping. Guarded by
 	// m_dirty_ranges_mutex; MarkGpuWritten drops every one it overlaps.
 	std::map<uint64_t, std::pair<uint64_t, uint32_t>>  m_known_fills;
+	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against
