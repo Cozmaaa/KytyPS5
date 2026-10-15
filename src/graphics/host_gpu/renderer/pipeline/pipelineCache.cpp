@@ -221,6 +221,10 @@ void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 	entry.count++;
 	entry.address = address;
 	entry.bytes   = bytes;
+	if (total < 16) {
+		LOGF("GpuOwnedSrtRead #%" PRIu64 ": hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%u\n",
+		     total, t_srt_shader_hash, address, bytes);
+	}
 	if (++total % 4096 == 0) {
 		LOGF("GpuOwnedSrtReads: total=%" PRIu64 " shaders=%zu\n", total, counts.size());
 		for (const auto& [hash, e]: counts) {
@@ -289,6 +293,14 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	// garbage collector happened to have downloaded the range first.
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
 		return false;
+	}
+	if (Libs::Graphics::GuestGpu::IsGpuThread()) {
+		static uint32_t logged = 0;
+		if (logged < 16) {
+			logged++;
+			LOGF("GpuOwnedShaderRead: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%zu\n",
+			     t_srt_shader_hash, address, values.size_bytes());
+		}
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;

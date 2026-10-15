@@ -688,10 +688,20 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return false;
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
-	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+	// The guest's code, read through `read`: bytes no GPU work wrote come from the backing store,
+	// without the tracked-page fault. Comparing through the guest mapping faulted whenever the GPU
+	// had written other bytes of the code's page, and the fault drained the GPU: once a frame in
+	// UFC 5 fights, ~10 % of the GPU thread (2026-10-15).
+	thread_local std::vector<uint32_t> current;
+	current.resize(code.size());
+	const bool read_ok =
+	    !code.empty() && read(reinterpret_cast<uint64_t>(code.data()), std::span<uint32_t>(current));
+	const std::span<const uint32_t> guest =
+	    read_ok ? std::span<const uint32_t>(current) : code;
+	if (shader.analysis.code.size() != guest.size() ||
+	    !std::equal(guest.begin(), guest.end(), shader.analysis.code.begin())) {
 		shader = {};
-		AnalyzeShader(code, shader.analysis);
+		AnalyzeShader(guest, shader.analysis);
 	}
 	const auto& analysis = shader.analysis;
 	if (!analysis.has_calls) return true;
