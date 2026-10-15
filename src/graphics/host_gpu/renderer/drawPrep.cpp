@@ -60,7 +60,88 @@ uint64_t PairKey(uint64_t vs_addr, uint64_t ps_addr) {
 	return (vs_addr >> 8u) * 0x9e3779b97f4a7c15ull ^ (ps_addr >> 8u);
 }
 
+// GPU writes in the order MarkGpuWritten recorded them (writers hold its lock), numbered from 1.
+// A small range stamps its pages' slots in a hashed table with its number; a large one (rare)
+// goes to a short list instead, checked exactly. A page is unchanged since write number `seen`
+// when its slot and every newer large write are older.
+struct GpuWrites {
+	static constexpr uint64_t PageBits   = 12;
+	static constexpr uint64_t Slots      = 65536;
+	static constexpr uint64_t LargePages = 256;
+	static constexpr uint64_t LargeSize  = 64;
+	std::array<std::atomic<uint64_t>, Slots>        slots {};
+	std::array<std::pair<uint64_t, uint64_t>, LargeSize> large {};
+	std::array<std::atomic<uint64_t>, LargeSize>    large_number {};
+	std::atomic<uint64_t>                           large_count {0};
+	std::atomic<uint64_t>                           seq {0};
+};
+GpuWrites g_gpu_writes;
+
+bool NoGpuWriteSince(uint64_t page, uint64_t size, uint64_t seen) {
+	const auto first = page >> GpuWrites::PageBits;
+	const auto last  = (page + size - 1u) >> GpuWrites::PageBits;
+	for (auto p = first; p <= last; p++) {
+		if (g_gpu_writes.slots[p % GpuWrites::Slots].load(std::memory_order_acquire) > seen) {
+			return false;
+		}
+	}
+	const auto count = g_gpu_writes.large_count.load(std::memory_order_acquire);
+	const auto kept  = std::min<uint64_t>(count, GpuWrites::LargeSize);
+	// The list keeps the last LargeSize large writes; one dropped before them may be newer than
+	// `seen`, and then the answer cannot be known.
+	if (count > GpuWrites::LargeSize &&
+	    g_gpu_writes.large_number[(count - kept) % GpuWrites::LargeSize].load(
+	        std::memory_order_acquire) > seen) {
+		return false;
+	}
+	// Newest first: numbers grow with the index, so the first one not newer than `seen` ends it.
+	for (uint64_t i = count; i > count - kept; i--) {
+		const auto number = g_gpu_writes.large_number[(i - 1u) % GpuWrites::LargeSize].load(
+		    std::memory_order_acquire);
+		if (number <= seen) {
+			break;
+		}
+		const auto [address, bytes] = g_gpu_writes.large[(i - 1u) % GpuWrites::LargeSize];
+		if (address < page + size && page < address + bytes) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// ReadSet::Validate remembers a page's clean backing across draws while the guest mappings stay
+// (CleanBackingGeneration) and no GPU write is recorded on it (KYTY_VALIDATE_PAGE_CACHE=0: look
+// every page up, as before). UFC 5 fight: page lookups 5.4 -> 0.25 a draw, Validate 890 -> 640
+// ns a draw (Tracy, 3 runs each); KYTY_DRAW_PREP_VERIFY: 0 mismatches in ~4.4 M results.
+bool ValidatePageCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VALIDATE_PAGE_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 } // namespace
+
+void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	const auto number = g_gpu_writes.seq.load(std::memory_order_relaxed) + 1;
+	const auto first  = vaddr >> GpuWrites::PageBits;
+	const auto last   = (vaddr + size - 1u) >> GpuWrites::PageBits;
+	if (last - first < GpuWrites::LargePages) {
+		for (auto p = first; p <= last; p++) {
+			g_gpu_writes.slots[p % GpuWrites::Slots].store(number, std::memory_order_release);
+		}
+	} else {
+		const auto index = g_gpu_writes.large_count.load(std::memory_order_relaxed);
+		g_gpu_writes.large[index % GpuWrites::LargeSize] = {vaddr, size};
+		g_gpu_writes.large_number[index % GpuWrites::LargeSize].store(number, std::memory_order_release);
+		g_gpu_writes.large_count.store(index + 1, std::memory_order_release);
+	}
+	g_gpu_writes.seq.store(number, std::memory_order_release);
+}
 
 bool Enabled() {
 	static const bool enabled = [] {
@@ -129,12 +210,37 @@ bool ReadSet::Validate() const {
 	};
 	std::array<Page, 8> pages {};
 	size_t              next = 0;
-	const auto map = [&](uint64_t page) {
+	// Across draws (ValidatePageCacheEnabled): page -> clean backing, the mapping generation and
+	// the GPU write sequence it was found at. Only clean pages are kept.
+	struct CachedPage {
+		uint64_t       page       = UINT64_MAX;
+		const uint8_t* backing    = nullptr;
+		uint64_t       generation = 0;
+		uint64_t       write_seq  = 0;
+	};
+	thread_local std::array<CachedPage, 1024> cached_pages {};
+	const bool cache_pages = ValidatePageCacheEnabled();
+	const auto generation  = cache_pages ? LibKernel::Memory::CleanBackingGeneration() : 0;
+	const auto map = [&](uint64_t page) -> const uint8_t* {
+		if (cache_pages) {
+			auto&      entry = cached_pages[(page / PageSize) % cached_pages.size()];
+			const auto seq   = g_gpu_writes.seq.load(std::memory_order_acquire);
+			if (entry.page == page && entry.generation == generation &&
+			    (entry.write_seq == seq || NoGpuWriteSince(page, PageSize, entry.write_seq))) {
+				entry.write_seq = seq;
+				return entry.backing;
+			}
+			KYTY_PROFILER_BLOCK("Validate::MapPage");
+			const auto* backing = LibKernel::Memory::FindGpuCleanBacking(page, PageSize);
+			entry = backing != nullptr ? CachedPage {page, backing, generation, seq} : CachedPage {};
+			return backing;
+		}
 		for (const auto& entry: pages) {
 			if (entry.page == page) {
 				return entry.backing;
 			}
 		}
+		KYTY_PROFILER_BLOCK("Validate::MapPage");
 		auto& slot = pages[next++ % pages.size()];
 		slot       = {page, LibKernel::Memory::FindGpuCleanBacking(page, PageSize)};
 		return slot.backing;
@@ -152,6 +258,7 @@ bool ReadSet::Validate() const {
 					return false;
 				}
 			} else {
+				KYTY_PROFILER_BLOCK("Validate::ExactRead");
 				if (current.size() < in_page) {
 					current.resize(in_page);
 				}

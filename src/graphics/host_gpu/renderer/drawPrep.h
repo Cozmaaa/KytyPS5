@@ -135,6 +135,10 @@ enum class Counter : uint32_t {
 	Count,
 };
 void Add(Counter counter, uint64_t value = 1);
+
+// BufferCache::MarkGpuWritten, under its dirty-range lock: the GPU-written range, so that
+// ReadSet::Validate's page cache drops the pages it covers.
+void NoteGpuWrite(uint64_t vaddr, uint64_t size);
 void LogCountersIfDue();
 
 // GPU thread: a vertex/pixel shader pair whose programs it prepared successfully; the scanner

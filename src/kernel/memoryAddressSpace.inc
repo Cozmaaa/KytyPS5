@@ -211,6 +211,10 @@ public:
 		}
 	}
 
+	[[nodiscard]] uint64_t MapsGeneration() const {
+		return m_maps_generation.load(std::memory_order_acquire);
+	}
+
 	[[nodiscard]] bool IsAvailable() const {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return m_handle != nullptr && m_backing_base != nullptr;
@@ -954,6 +958,8 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
+
+	[[nodiscard]] uint64_t BackingMapsGeneration() const { return m_backing->MapsGeneration(); }
 
 	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
 		return m_backing->FindBacking(vaddr, size);

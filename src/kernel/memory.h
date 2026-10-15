@@ -123,6 +123,9 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Changes whenever guest mappings or their coverage change: a FindGpuCleanBacking result for an
+// address stays the same pointer until then (whether it is still GPU-clean is another matter).
+[[nodiscard]] uint64_t CleanBackingGeneration();
 // Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
 // TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
 // queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).

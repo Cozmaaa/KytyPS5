@@ -1025,6 +1025,14 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
+uint64_t CleanBackingGeneration() {
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr) {
+		return 0;
+	}
+	// Both only grow: their sum changes whenever either does.
+	return g_guest_address_space->BackingMapsGeneration() + g_virtual_ranges->CoverageGeneration();
+}
+
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_guest_address_space == nullptr || MaybeGpuDirtyForClean(vaddr, size)) {
 		return nullptr;
