@@ -318,6 +318,22 @@ public:
 	void endRendering() const {
 		Run([](vk::CommandBuffer command) { command.endRendering(); });
 	}
+	// VK_EXT_conditional_rendering: the 32-bit value at buffer + offset, non-zero, lets the draws,
+	// dispatches and attachment clears between begin and end run.
+	void beginConditionalRenderingEXT(vk::Buffer buffer, vk::DeviceSize offset) const {
+		Run([=](vk::CommandBuffer command) {
+			vk::ConditionalRenderingBeginInfoEXT info {};
+			info.buffer = buffer;
+			info.offset = offset;
+			command.beginConditionalRenderingEXT(info);
+		});
+	}
+	void endConditionalRenderingEXT() const {
+		Run([](vk::CommandBuffer command) { command.endConditionalRenderingEXT(); });
+	}
+	void clearAttachments(const vk::ClearAttachment& attachment, const vk::ClearRect& rect) const {
+		Run([=](vk::CommandBuffer command) { command.clearAttachments(1, &attachment, 1, &rect); });
+	}
 	void setCheckpointNV(const void* marker) const {
 		Run([=](vk::CommandBuffer command) { command.setCheckpointNV(marker); });
 	}

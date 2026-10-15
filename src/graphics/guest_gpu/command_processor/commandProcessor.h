@@ -72,6 +72,7 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	void            BufferFlushAndWait();
 	void            BufferWait();
 	// See CommandScheduler::CompleteReleaseMemWrite -- only safe for a RELEASE_MEM that already
 	// wrote its guest-visible value synchronously and scheduled no interrupt callback.

@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/colorClearCheck.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -247,6 +248,15 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		LOGF("TextureCache: thresholds capped at %" PRIu64 " MB (trigger %" PRIu64 ", critical %" PRIu64
 		     " MB)\n",
 		     m_pressure_gc_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
+	}
+	// KYTY_GPU_CLEAR_CHECK=1: color clear checks of GPU-written metadata run on the GPU.
+	if (const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
+	    value != nullptr && (value[0] == '1' || value[0] == '2')) {
+		if (m_graphics.conditional_rendering_enabled) {
+			m_clear_check = std::make_unique<ColorClearCheck>(graphics, scheduler);
+		}
+		LOGF("TextureCache: GPU color clear check %s\n",
+		     m_clear_check != nullptr ? "on" : "unavailable (no VK_EXT_conditional_rendering)");
 	}
 }
 
@@ -1329,6 +1339,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			all_known    = all_known && known[slice] != 0;
 		}
 	}
+	// GPU-written metadata no known fill accounts for: check it on the GPU instead of draining
+	// (KYTY_GPU_CLEAR_CHECK=1, ColorClearCheck).
+	if (!all_known && m_clear_check != nullptr && !volume_texture &&
+	    m_buffer_cache.IsRegionGpuModified(range.address, range.size) &&
+	    m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) &&
+	    MaterializeColorClearOnGpu(id, desc, range.address, slice_size, first, image_first, count)) {
+		return;
+	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (!all_known && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
@@ -1385,6 +1403,125 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint64_t address,
+                                              uint64_t slice_size, uint32_t first,
+                                              uint32_t image_first, uint32_t count) {
+	const auto& view = desc.view_info;
+	// The codes that would clear this binding (DecodeColorClear), each with its color.
+	std::array<uint8_t, ColorClearCheck::MaxCodes>             codes {};
+	std::array<vk::ClearColorValue, ColorClearCheck::MaxCodes> colors {};
+	uint32_t                                                   code_count = 0;
+	for (const uint8_t code: {uint8_t {0x00}, uint8_t {0x20}, uint8_t {0x40}, uint8_t {0x80},
+	                          uint8_t {0xc0}}) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			codes[code_count]    = code;
+			colors[code_count++] = color;
+		}
+	}
+	if (code_count == 0) {
+		// The CPU check could only read the bytes and find nothing to clear.
+		return true;
+	}
+	if (slice_size % sizeof(uint32_t) != 0 || slice_size / sizeof(uint32_t) > UINT32_MAX ||
+	    view.level_count != 1) {
+		return false;
+	}
+	{
+		// The clears go through a color attachment of the backing format; anything else (block,
+		// depth, aliased or unrenderable formats) keeps the CPU check.
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		if (image.depth_id || image.info.IsBlock() || image.info.IsDepth() ||
+		    view.format != image.backing.format ||
+		    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+		      vk::FormatFeatureFlagBits::eColorAttachment)) {
+			return false;
+		}
+		// A clear that does not happen must leave the guest's contents, so make them current
+		// first, as ClearImage does for partial clears.
+		TrackImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			InitializeImage(id);
+			if (image.IsBufferModified() || image.IsCpuDirty()) {
+				return false;
+			}
+		}
+	}
+	static uint64_t gpu_checks = 0;
+	if (++gpu_checks % 4096 == 1) {
+		LOGF("TextureCache: color metadata checked on the GPU %" PRIu64 " times\n", gpu_checks);
+	}
+	// KYTY_GPU_CLEAR_CHECK=2: the keys are not expanded (diagnostics).
+	static const bool no_expand = [] {
+		const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
+		return value != nullptr && value[0] == '2';
+	}();
+	const bool expand  = desc.type != BindingType::VideoOut && !no_expand;
+	auto&      command = m_scheduler.Current();
+	command.EndRendering();
+	// The slices' GPU copy (CPU-written bytes are uploaded first); expanding keys writes it.
+	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(
+	    address + slice_size * first, slice_size * count, expand, false, {}, true);
+	const auto base     = buffer->BufferDeviceAddress() + offset;
+	const auto recorder = command.Recorder();
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto result =
+		    m_clear_check->Record(recorder, base + slice_size * slice,
+		                          static_cast<uint32_t>(slice_size / sizeof(uint32_t)), codes,
+		                          code_count, expand);
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		ImageViewInfo    layer {};
+		layer.format      = view.format;
+		layer.type        = vk::ImageViewType::e2D;
+		layer.base_level  = view.base_level;
+		layer.base_layer  = image_first + slice;
+		layer.layer_count = 1;
+		layer.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, recorder);
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(layer);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+		                           std::max(image.info.extent.height >> view.base_level, 1u)};
+		vk::RenderingInfo  rendering {};
+		rendering.renderArea.extent    = extent;
+		rendering.layerCount           = 1;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		for (uint32_t k = 0; k < code_count; k++) {
+			// Only vkCmdClearAttachments obeys conditional rendering; transfer clears do not.
+			recorder.beginConditionalRenderingEXT(result.predicates, result.code_offset[k]);
+			recorder.beginRendering(rendering);
+			vk::ClearAttachment clear {};
+			clear.aspectMask        = vk::ImageAspectFlagBits::eColor;
+			clear.colorAttachment   = 0;
+			clear.clearValue.color  = colors[k];
+			const vk::ClearRect rect {vk::Rect2D {{0, 0}, extent}, 0, 1};
+			recorder.clearAttachments(clear, rect);
+			recorder.endRendering();
+			recorder.endConditionalRenderingEXT();
+		}
+		CommitGpuWrite(image);
+	}
+	// Diagnostics: KYTY_GPU_CLEAR_CHECK_SYNC=1 submits afterwards, =2 also waits for the GPU, as
+	// the CPU check's download did (to tell its wait from its bytes).
+	static const int sync = [] {
+		const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK_SYNC");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (sync == 1) {
+		m_scheduler.Flush();
+	} else if (sync == 2) {
+		m_scheduler.FlushAndWait();
+	}
+	return true;
 }
 
 void TextureCache::RefreshImage(ImageId id) {

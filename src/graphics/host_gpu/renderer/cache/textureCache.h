@@ -28,6 +28,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class Buffer;
 class BufferCache;
+class ColorClearCheck;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
@@ -170,6 +171,11 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// The check of MaterializeColorClear recorded on the GPU (ColorClearCheck), for GPU-written
+	// metadata. False: not possible here; the caller checks on the CPU.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint64_t address,
+	                                              uint64_t slice_size, uint32_t first,
+	                                              uint32_t image_first, uint32_t count);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -210,6 +216,7 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::unique_ptr<ColorClearCheck>                  m_clear_check;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;

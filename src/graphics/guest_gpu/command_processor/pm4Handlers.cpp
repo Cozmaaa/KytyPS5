@@ -1872,6 +1872,15 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 
 	cp.SetFlip(f);
 	cp.Flip();
+	// Diagnostics: KYTY_FLIP_WAIT=1 waits for the GPU to finish everything before each flip,
+	// which bounds how far the GPU thread runs ahead of the GPU to one frame.
+	static const bool flip_wait = [] {
+		const char* value = std::getenv("KYTY_FLIP_WAIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (flip_wait) {
+		cp.BufferFlushAndWait();
+	}
 	return 5;
 }
 

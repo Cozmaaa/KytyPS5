@@ -421,6 +421,10 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::BufferFlushAndWait() {
+	GetScheduler().FlushAndWait();
+}
+
 void CommandProcessor::CompleteReleaseMemWrite() {
 	GetScheduler().CompleteReleaseMemWrite();
 }
