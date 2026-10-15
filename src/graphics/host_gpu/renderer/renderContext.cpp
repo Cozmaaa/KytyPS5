@@ -198,7 +198,12 @@ void RenderContext::PrepareBda() {
 	// anyway. Per draw, the walk and the re-protection it triggers took ~38 % of the GPU thread
 	// on the title menu (21 -> 32 fps).
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
-	if (epoch != m_bda_synced_epoch) {
+	// KYTY_BDA_SYNC_EVERY=1: walk whenever the epoch moved, not at most once per submission.
+	static const bool sync_every = [] {
+		const char* value = std::getenv("KYTY_BDA_SYNC_EVERY");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (epoch != m_bda_synced_epoch && !sync_every) {
 		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
 		if (submission == m_bda_synced_submission) {
 			m_fault_process_pending = true;

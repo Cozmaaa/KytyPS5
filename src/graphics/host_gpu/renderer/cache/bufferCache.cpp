@@ -1318,7 +1318,33 @@ void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
 	EraseKnownFillsLocked(vaddr, size);
 }
 
+void BufferCache::MarkClearChecked(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	if (m_clear_checked.size() >= 8192) {
+		m_clear_checked.clear();
+	}
+	m_clear_checked[vaddr] = std::max(m_clear_checked[vaddr], vaddr + size);
+}
+
+bool BufferCache::IsClearChecked(uint64_t vaddr, uint64_t size) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	const auto       it = m_clear_checked.find(vaddr);
+	return it != m_clear_checked.end() && it->second >= vaddr + size;
+}
+
 void BufferCache::EraseKnownFillsLocked(uint64_t vaddr, uint64_t size) {
+	if (!m_clear_checked.empty()) {
+		auto checked = m_clear_checked.upper_bound(vaddr);
+		if (checked != m_clear_checked.begin() && std::prev(checked)->second > vaddr) {
+			--checked;
+		}
+		while (checked != m_clear_checked.end() && checked->first < vaddr + size) {
+			checked = m_clear_checked.erase(checked);
+		}
+	}
 	if (m_known_fills.empty()) {
 		return;
 	}

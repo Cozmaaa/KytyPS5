@@ -111,6 +111,11 @@ public:
 	// Drops the known fills a GPU write outside the buffer path overlaps (an image write: render
 	// target, storage image, image copy or clear). Those never reach MarkGpuWritten.
 	void ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	// Color metadata the GPU-side clear check (TextureCache::MaterializeColorClearOnGpu) already
+	// examined, until a GPU write marks bytes of it again (the same rule as known fills): the
+	// check of an unchanged slice finds nothing new, so it is skipped.
+	void               MarkClearChecked(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsClearChecked(uint64_t vaddr, uint64_t size);
 	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
 	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
 	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
@@ -232,6 +237,8 @@ private:
 	// m_dirty_ranges_mutex; MarkGpuWritten drops every one it overlaps.
 	std::map<uint64_t, std::pair<uint64_t, uint32_t>>  m_known_fills;
 	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
+	// MarkClearChecked ranges: begin -> end. Guarded and erased with m_known_fills.
+	std::map<uint64_t, uint64_t>                        m_clear_checked;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against

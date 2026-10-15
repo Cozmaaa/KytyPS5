@@ -251,7 +251,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	}
 	// KYTY_GPU_CLEAR_CHECK=1: color clear checks of GPU-written metadata run on the GPU.
 	if (const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
-	    value != nullptr && (value[0] == '1' || value[0] == '2')) {
+	    value != nullptr && (value[0] == '1' || value[0] == '2' || value[0] == '3')) {
 		if (m_graphics.conditional_rendering_enabled) {
 			m_clear_check = std::make_unique<ColorClearCheck>(graphics, scheduler);
 		}
@@ -1339,13 +1339,35 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			all_known    = all_known && known[slice] != 0;
 		}
 	}
+	// KYTY_KNOWN_FILLS=2 (diagnostics): the CPU check still decides; the known fills' answers are
+	// compared with the downloaded bytes, and mismatches are logged.
+	static const bool verify_known = [] {
+		const char* value = std::getenv("KYTY_KNOWN_FILLS");
+		return value != nullptr && value[0] == '2';
+	}();
+	std::vector<uint8_t> verify(count, 0);
+	if (verify_known) {
+		verify = known;
+		std::fill(known.begin(), known.end(), uint8_t {0});
+		all_known = false;
+	}
 	// GPU-written metadata no known fill accounts for: check it on the GPU instead of draining
 	// (KYTY_GPU_CLEAR_CHECK=1, ColorClearCheck).
 	if (!all_known && m_clear_check != nullptr && !volume_texture &&
 	    m_buffer_cache.IsRegionGpuModified(range.address, range.size) &&
-	    m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) &&
-	    MaterializeColorClearOnGpu(id, desc, range.address, slice_size, first, image_first, count)) {
-		return;
+	    m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+		const auto checked_address = range.address + slice_size * first;
+		const auto checked_size    = slice_size * count;
+		// Nothing wrote these slices since their last check (and the CPU did not either).
+		if (m_buffer_cache.IsClearChecked(checked_address, checked_size) &&
+		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+			return;
+		}
+		if (MaterializeColorClearOnGpu(id, desc, range.address, slice_size, first, image_first,
+		                               count)) {
+			m_buffer_cache.MarkClearChecked(checked_address, checked_size);
+			return;
+		}
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
@@ -1373,6 +1395,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		} else if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
+		if (verify[slice] != 0) {
+			static uint64_t verified   = 0;
+			static uint64_t mismatched = 0;
+			uint64_t        wrong      = 0;
+			for (uint64_t i = 0; i < slice_size; i++) {
+				wrong += bytes[i] != static_cast<uint8_t>(known_values[slice] >> (8u * (i & 3u))) ? 1 : 0;
+			}
+			verified++;
+			if (wrong != 0 && ++mismatched <= 32) {
+				LOGF("KnownFills verify: MISMATCH addr=0x%016" PRIx64 " slice=%u/%u size=0x%" PRIx64
+				     " known=0x%08" PRIx32 " actual[0]=0x%02x wrong_bytes=%" PRIu64 " type=%u format=%u\n",
+				     address, first + slice, layers, slice_size, known_values[slice], bytes[0], wrong,
+				     static_cast<uint32_t>(desc.type), static_cast<uint32_t>(desc.view_info.format));
+			}
+			if (verified % 1024 == 1) {
+				LOGF("KnownFills verify: %" PRIu64 " slices, %" PRIu64 " mismatched\n", verified,
+				     mismatched);
+			}
+		}
 		const uint8_t  code = bytes[0];
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
@@ -1390,8 +1431,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Known metadata is still GPU-written: the expanded keys go to the GPU copy, in order,
 		// and are recorded, so the next check reads them without a download either.
 		if (known[slice] != 0) {
+			// KYTY_KNOWN_FILLS=3: the expanded keys reach guest memory too, as after the CPU
+			// check (WriteClean: no download, and the bytes stop being GPU-written).
+			static const bool write_clean = [] {
+				const char* value = std::getenv("KYTY_KNOWN_FILLS");
+				return value != nullptr && value[0] == '3';
+			}();
 			if (desc.type != BindingType::VideoOut) {
-				m_buffer_cache.FillKnown(address, slice_size, 0xffffffffu);
+				const std::vector<uint8_t> keys(slice_size, uint8_t {0xff});
+				if (!write_clean || !m_buffer_cache.WriteClean(address, keys.data(), keys.size())) {
+					m_buffer_cache.FillKnown(address, slice_size, 0xffffffffu);
+				}
 			}
 			continue;
 		}
@@ -1454,11 +1504,13 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	if (++gpu_checks % 4096 == 1) {
 		LOGF("TextureCache: color metadata checked on the GPU %" PRIu64 " times\n", gpu_checks);
 	}
-	// KYTY_GPU_CLEAR_CHECK=2: the keys are not expanded (diagnostics).
-	static const bool no_expand = [] {
+	// Diagnostics: KYTY_GPU_CLEAR_CHECK=2 does not expand the keys; =3 records the check only (no
+	// clears, no expansion), to tell its decisions from the drain it replaces.
+	static const char mode = [] {
 		const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
-		return value != nullptr && value[0] == '2';
+		return value != nullptr ? value[0] : '1';
 	}();
+	const bool no_expand = mode == '2' || mode == '3';
 	const bool expand  = desc.type != BindingType::VideoOut && !no_expand;
 	auto&      command = m_scheduler.Current();
 	command.EndRendering();
@@ -1495,7 +1547,7 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		rendering.layerCount           = 1;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
-		for (uint32_t k = 0; k < code_count; k++) {
+		for (uint32_t k = 0; k < (mode == '3' ? 0u : code_count); k++) {
 			// Only vkCmdClearAttachments obeys conditional rendering; transfer clears do not.
 			recorder.beginConditionalRenderingEXT(result.predicates, result.code_offset[k]);
 			recorder.beginRendering(rendering);
