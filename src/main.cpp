@@ -138,7 +138,7 @@ static void PrintUsage() {
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
 	::printf("  --cpu-placement <true|false>         X3D mode: V-Cache CCD, own cores and priorities for\n"
-	         "                                       the emulator's hot threads (default true).\n");
+	         "                                       the emulator's hot threads (default false).\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"

@@ -122,7 +122,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   bindless_images_enabled     = false;
-	bool                   cpu_placement_enabled       = true;
+	bool                   cpu_placement_enabled       = false;
 	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;

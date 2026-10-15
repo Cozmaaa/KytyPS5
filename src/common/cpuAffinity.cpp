@@ -28,23 +28,37 @@
 
 namespace Common {
 
-static std::atomic<bool> g_cli_enabled {true};
+// --cpu-placement: -1 not given, 0 false, 1 true.
+static std::atomic<int> g_cli_x3d {-1};
 
 void SetCpuPlacementEnabled(bool enabled) {
-	g_cli_enabled.store(enabled);
+	g_cli_x3d.store(enabled ? 1 : 0);
 }
 
 #if !defined(__APPLE__)
 
-static bool Enabled() {
-	static const bool enabled = [] {
+enum class Mode {
+	Off,    // KYTY_PCORE_AFFINITY=0: nothing at all.
+	Hybrid, // Default: only the hybrid-CPU rule (critical and high threads on performance cores).
+	X3d,    // KYTY_X3D=1 / --cpu-placement true: the whole placement described in the header.
+};
+
+static Mode GetMode() {
+	static const Mode mode = [] {
 		const char* x3d    = std::getenv("KYTY_X3D");
-		const char* legacy = std::getenv("KYTY_PCORE_AFFINITY");
-		return g_cli_enabled.load() && (x3d == nullptr || x3d[0] != '0') &&
-		       (legacy == nullptr || legacy[0] != '0');
+		const char* pcores = std::getenv("KYTY_PCORE_AFFINITY");
+		const int   cli    = g_cli_x3d.load();
+		const bool  on     = cli >= 0 ? cli == 1 : (x3d != nullptr && x3d[0] == '1');
+		if (on) {
+			return Mode::X3d;
+		}
+		return pcores != nullptr && pcores[0] == '0' ? Mode::Off : Mode::Hybrid;
 	}();
-	return enabled;
+	return mode;
 }
+
+// Whether PlaceCurrentThread acts: X3D mode, or the hybrid rule on a hybrid CPU.
+static std::atomic<bool> g_active {false};
 
 static const char* ClassName(ThreadClass cls) {
 	switch (cls) {
@@ -280,8 +294,9 @@ static void DisablePowerThrottling(HANDLE thread) {
 void InitCpuPlacement() {
 	static std::once_flag once;
 	std::call_once(once, [] {
-		if (!Enabled()) {
-			LOGF("CPU placement: off (KYTY_X3D=0 or --cpu-placement false)\n");
+		const auto mode = GetMode();
+		if (mode == Mode::Off) {
+			LOGF("CPU placement: off (KYTY_PCORE_AFFINITY=0)\n");
 			return;
 		}
 		auto& t = GetTopology();
@@ -289,7 +304,15 @@ void InitCpuPlacement() {
 			LOGF("CPU placement: no CPU set information, nothing done\n");
 			return;
 		}
+		if (mode == Mode::Hybrid) {
+			Plan(t, false);
+			g_active = t.hybrid;
+			LOGF("CPU placement: X3D mode off (KYTY_X3D=1 or --cpu-placement true turns it on)%s\n",
+			     t.hybrid ? "; critical and high threads stay on the performance cores" : "");
+			return;
+		}
 		Plan(t, true);
+		g_active = true;
 		LogTopology(t);
 		// Windows may run the process at reduced speed (EcoQoS) when its window is not in front.
 		PROCESS_POWER_THROTTLING_STATE power {};
@@ -312,7 +335,18 @@ void InitCpuPlacement() {
 void PlaceCurrentThread(ThreadClass cls, const char* name) {
 	InitCpuPlacement();
 	auto& t = GetTopology();
-	if (!Enabled() || t.all.empty()) {
+	if (!g_active || t.all.empty()) {
+		return;
+	}
+	if (GetMode() == Mode::Hybrid) {
+		// The rule from before X3D mode: the threads the GPU waits on avoid the efficiency cores.
+		if (cls != ThreadClass::Critical && cls != ThreadClass::High) {
+			return;
+		}
+		const bool ok = SetThreadSelectedCpuSets(GetCurrentThread(), reinterpret_cast<const ULONG*>(t.fast.data()),
+		                                         static_cast<ULONG>(t.fast.size())) != 0;
+		LOGF("CPU placement: %s on performance cores %s%s\n", name, FormatList(Numbers(t, t.fast)).c_str(),
+		     ok ? "" : " - failed");
 		return;
 	}
 	const std::vector<uint32_t>* ids = nullptr;
@@ -424,8 +458,9 @@ static bool ReadTopology(Topology& t) {
 void InitCpuPlacement() {
 	static std::once_flag once;
 	std::call_once(once, [] {
-		if (!Enabled()) {
-			LOGF("CPU placement: off (KYTY_X3D=0 or --cpu-placement false)\n");
+		const auto mode = GetMode();
+		if (mode == Mode::Off) {
+			LOGF("CPU placement: off (KYTY_PCORE_AFFINITY=0)\n");
 			return;
 		}
 		auto& t = GetTopology();
@@ -435,20 +470,26 @@ void InitCpuPlacement() {
 		// Linux has no process-wide default that spares reserved cores without also binding every
 		// thread created later, so nothing is reserved.
 		Plan(t, false);
-		LogTopology(t);
+		g_active = mode == Mode::X3d || t.hybrid;
+		if (mode == Mode::X3d) {
+			LogTopology(t);
+		}
 	});
 }
 
 void PlaceCurrentThread(ThreadClass cls, const char* name) {
 	InitCpuPlacement();
 	auto& t = GetTopology();
-	if (!Enabled() || t.all.empty()) {
+	if (!g_active || t.all.empty()) {
 		return;
+	}
+	const bool hot = cls == ThreadClass::Critical || cls == ThreadClass::High;
+	if (GetMode() == Mode::Hybrid && !hot) {
+		return; // The hybrid rule only keeps the hot threads off the efficiency cores.
 	}
 	// Affinity is inherited by threads created later, so only whole sets are used: the fast cores
 	// for the critical and high threads, the slow ones for background work.
-	const auto& ids =
-	    (cls == ThreadClass::Critical || cls == ThreadClass::High) ? t.fast : t.background;
+	const auto& ids = hot ? t.fast : t.background;
 	if (ids.empty() || ids.size() == t.all.size()) {
 		return;
 	}
