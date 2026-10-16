@@ -83,6 +83,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		if (g_tracker_on_gpu_thread) {
+			NoteGpuThreadDirty(buffer.CpuAddress(), buffer.Size());
+		}
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);

@@ -636,6 +636,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.enqueued_seq = g_guest_enqueued_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
 	if (m_draw_prep != nullptr) {
 		// In queue order, as the GPU thread will run them.
 		if (submission.type == SubmissionType::Graphics ||
@@ -667,6 +668,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::PlaceCurrentThread(Common::ThreadClass::Critical, "GPU thread");
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
+	g_tracker_on_gpu_thread = true;
 	g_gpu_state  = gpu;
 
 	for (;;) {
@@ -777,6 +779,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
+		g_processing_enqueued_seq = submission.enqueued_seq;
 		// Texture-heap entries the guest wrote before submitting are visible to all of this
 		// submission's draws, as on the console.
 		m_renderer.GetRenderExecutor().SyncBindlessHeaps();

@@ -84,6 +84,7 @@ private:
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
+		uint64_t                  enqueued_seq      = 0; // g_guest_enqueued_seq when queued
 	};
 
 	void              Enqueue(Submission submission);

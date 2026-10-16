@@ -210,7 +210,42 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_BDA_SYNC_PER_FRAME");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (epoch != m_bda_synced_epoch && !sync_every) {
+	// A walk syncs every CPU write made before it starts, so a submission queued before the last
+	// walk started is covered by it: the GPU thread runs a frame or so behind the game, and walking
+	// again for each of its submissions re-uploaded and re-protected the pages the game had written
+	// since (~5 walks a frame in UFC 5 fights, ~1.4 ms each). Writes made by the GPU thread itself
+	// (command processor copies, new buffers) are no submission's, so they still start a walk.
+	// So does a WAIT_REG_MEM: the game writes data after queuing the command buffer that reads it
+	// and releases the GPU with a label (without that rule, black heads and plain shorts in UFC 5
+	// fights). Opt-in (KYTY_BDA_WALK_ENQUEUED=1): UFC 5 waits before nearly every submission, so the
+	// walks stay as frequent (2026-10-15: 36,864 walks either way, 28.2 vs 28.5 fps standing).
+	static const bool walk_enqueued = [] {
+		const char* value = std::getenv("KYTY_BDA_WALK_ENQUEUED");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (epoch != m_bda_synced_epoch && !sync_every && walk_enqueued && !per_frame) {
+		const bool newer    = g_processing_enqueued_seq > m_bda_walk_enqueued ||
+		                   g_gpu_wait_seq != m_bda_walk_wait;
+		const bool gpu_made = g_gpu_thread_dirty_seq != m_bda_walk_gpu_dirty;
+		if (!newer && !gpu_made) {
+			m_fault_process_pending = true;
+			return;
+		}
+		// Only the GPU thread wrote since the walk: its own ranges, not every dirty buffer.
+		if (!newer && !g_gpu_thread_dirty_overflow) {
+			for (const auto [address, bytes]: g_gpu_thread_dirty_ranges) {
+				m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(address, bytes);
+			}
+			g_gpu_thread_dirty_ranges.clear();
+			m_bda_walk_gpu_dirty     = g_gpu_thread_dirty_seq;
+			m_fault_process_pending  = true;
+			m_bda_walk_gpu_only     += 1;
+			return;
+		}
+		// Why walks run (diagnostics, in the walk log below).
+		m_bda_walk_newer += newer ? 1u : 0u;
+		m_bda_walk_gpu_made += gpu_made ? 1u : 0u;
+	} else if (epoch != m_bda_synced_epoch && !sync_every) {
 		const auto submission = per_frame && m_gpu != nullptr
 		                            ? static_cast<uint64_t>(m_gpu->GetFrameNum())
 		                            : g_guest_submission_seq.load(std::memory_order_relaxed);
@@ -224,6 +259,11 @@ void RenderContext::PrepareBda() {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
 		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_bda_walk_enqueued  = g_guest_enqueued_seq.load(std::memory_order_acquire);
+		m_bda_walk_gpu_dirty = g_gpu_thread_dirty_seq;
+		m_bda_walk_wait      = g_gpu_wait_seq;
+		g_gpu_thread_dirty_ranges.clear();
+		g_gpu_thread_dirty_overflow = false;
 		const auto start_time = std::chrono::steady_clock::now();
 		const auto uploads    = m_buffer_cache.SyncUploads();
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
@@ -243,6 +283,13 @@ void RenderContext::PrepareBda() {
 			     walks, g_guest_submission_seq.load(std::memory_order_relaxed), m_gpu->GetFrameNum(),
 			     static_cast<double>(walk_ns) / 2048.0 / 1000.0, static_cast<double>(walk_syncs) / 2048.0,
 			     static_cast<double>(walk_uploads) / 2048.0);
+			LOGF("BDA sync walk causes: newer submission %" PRIu64 ", GPU-thread writes %" PRIu64
+			     ", GPU-thread ranges only %" PRIu64
+			     " (enqueued %" PRIu64 ", processing %" PRIu64 ")\n",
+			     m_bda_walk_newer, m_bda_walk_gpu_made, m_bda_walk_gpu_only,
+			     g_guest_enqueued_seq.load(std::memory_order_relaxed),
+			     g_processing_enqueued_seq);
+			m_bda_walk_newer = m_bda_walk_gpu_made = m_bda_walk_gpu_only = 0;
 			walk_ns = walk_uploads = walk_syncs = 0;
 		}
 	}

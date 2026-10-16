@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <utility>
+#include <vector>
 #include <mutex>
 #include <utility>
 
@@ -71,6 +73,38 @@ inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
+// Bumped by the guest thread that submits, as it queues a submission (GuestGpu::Enqueue), which
+// stamps the submission with it. Every CPU write a submission may see was made before its stamp.
+inline std::atomic<uint64_t> g_guest_enqueued_seq {0};
+// The stamp of the submission the GPU thread runs now (GPU thread only).
+inline uint64_t g_processing_enqueued_seq = 0;
+// Bumped by the GPU thread at each WAIT_REG_MEM: the game writes data after queuing the command
+// buffer that reads it and lets the GPU past such a wait with a label, so its writes before the
+// label become visible there, not at the submission (UFC 5's skinned fighters and crowd).
+inline uint64_t g_gpu_wait_seq = 0;
+// Set on the GPU thread. CPU-dirty pages and buffer registrations it makes itself (command
+// processor copies and fills, new buffers) bump g_gpu_thread_dirty_seq: no submission stamp
+// covers them.
+inline thread_local bool g_tracker_on_gpu_thread = false;
+inline uint64_t          g_gpu_thread_dirty_seq  = 0;
+// The ranges behind g_gpu_thread_dirty_seq since RenderContext::PrepareBda last took them (GPU
+// thread only); past GpuThreadDirtyCapacity the list is dropped and the next preparation walks.
+inline constexpr size_t                            GpuThreadDirtyCapacity = 4096;
+inline std::vector<std::pair<uint64_t, uint64_t>> g_gpu_thread_dirty_ranges;
+inline bool                                        g_gpu_thread_dirty_overflow = false;
+inline void NoteGpuThreadDirty(uint64_t vaddr, uint64_t size) {
+	++g_gpu_thread_dirty_seq;
+	if (g_gpu_thread_dirty_overflow) {
+		return;
+	}
+	if (g_gpu_thread_dirty_ranges.size() >= GpuThreadDirtyCapacity) {
+		g_gpu_thread_dirty_overflow = true;
+		g_gpu_thread_dirty_ranges.clear();
+		return;
+	}
+	g_gpu_thread_dirty_ranges.emplace_back(vaddr, size);
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -119,6 +153,9 @@ public:
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				if (g_tracker_on_gpu_thread) {
+					NoteGpuThreadDirty(vaddr, size);
+				}
 			}
 		} else {
 			bits.UnsetRange(start, end);

@@ -2634,6 +2634,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
+	++g_gpu_wait_seq;
 
 	return payload_dw;
 }
