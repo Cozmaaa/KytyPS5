@@ -465,6 +465,8 @@ struct BindingLayout {
 	// (2 dwords), then the guest address of each memory binding's range start (2 dwords each; 0 =
 	// not tracked in this draw).
 	bool                           write_tracking      = false;
+	// Table mode (TablePlan): TableBlockDword() holds the block's device address (2 dwords).
+	uint32_t                       table_block_dwords  = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -474,8 +476,11 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t WriteTrackDword() const {
 		return BufferLengthDword() + memory_offset_count;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t TableBlockDword() const {
 		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return TableBlockDword() + table_block_dwords;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -593,6 +598,67 @@ struct ResourceBlock {
 	std::vector<uint32_t> srt_reads;
 };
 
+// Table mode (CompileOptions::table_mode; table-mode-port-plan.md step 1, after the Demon's Souls
+// fork's): a program that reads its flattened SRT slots and its buffers' ranges from one block in
+// GPU memory, whose device address is two dwords of shader data (BindingLayout::TableBlockDword),
+// instead of the flattened SRT binding, the buffer descriptors and the per-buffer shader data.
+// Images and samplers stay ordinary bindings.
+//
+// Slot s of the block is the flattened SRT's slot s, read as the normal path's refresh reads it
+// (SrtWalker's ComputeRawAddress, with `immediate` the load's own offset): a scalar address load
+// at (high:low) + offset, or, `bounded`, a scalar buffer load at `offset` into the V# (low, high,
+// records), 0 outside its range. An operand is an immediate, a user data register, a lower slot,
+// or the low or high dword of the stage's code address plus `value` (a V# the code embeds). Buffer
+// i's dwords, from BufferDword(i), describe the range the normal path would bind for its V#
+// (words): the device address of the range's start (2 dwords; aligned as a storage buffer
+// binding's offset), its length in dwords and the V#'s byte displacement from that start (the
+// normal path's memory offset; below 256). Formats and strides stay specialized as in normal mode
+// (ResourceSpecialization), so the renderer must check that a draw's V#s match the permutation.
+// The renderer evaluates the slots `cpu` marks (those the shader reads, `gpu`, and those the V#,
+// T# and S# words and the slot addresses need) from guest memory at each draw.
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
+struct TablePlan {
+	struct Operand {
+		enum class Kind : uint8_t { Immediate, UserData, Slot, ShaderBaseLow, ShaderBaseHigh };
+		Kind     kind  = Kind::Immediate;
+		uint32_t value = 0; // the immediate, the scalar register, the slot or the code offset
+
+		bool operator==(const Operand& other) const = default;
+	};
+	struct Slot {
+		Operand low, high, offset;
+		int32_t immediate = 0; // the load's offset (MemoryInfo::offset)
+		Operand records;       // bounded: the V#'s word 2
+		bool    bounded = false;
+
+		bool operator==(const Slot& other) const = default;
+	};
+	struct Descriptor {
+		std::array<Operand, 8> words {};
+		uint32_t               count = 0;
+
+		bool operator==(const Descriptor& other) const = default;
+	};
+
+	// Buffer i's dwords in the block: device address (2), length in dwords, byte offset.
+	static constexpr uint32_t BufferDwords = 4;
+
+	std::vector<Slot>                   slots;
+	std::vector<std::array<Operand, 4>> buffers; // the V# words, per ShaderInfo::buffers
+	std::vector<Descriptor>             images, samplers;
+	std::vector<uint8_t>                gpu, cpu; // per slot
+	// Flat or global memory: the BDA page table and fault buffer stay bindings, prepared as in
+	// normal mode (CompiledShaderInfo::bda_read_plan).
+	bool global_memory = false;
+
+	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
+		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
+	}
+	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+
+	bool operator==(const TablePlan& other) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct CompiledShaderInfo {
@@ -609,6 +675,9 @@ struct CompiledShaderInfo {
 	// What its flat and global loads can read (BuildBdaReadPlan): a draw's BDA preparation then
 	// synchronizes only those ranges.
 	BdaReadPlan                   bda_read_plan;
+	// A table mode program (TablePlan) and its plan.
+	bool                          table_mode          = false;
+	TablePlan                     table_plan;
 	// Table mode census (KYTY_TABLE_CENSUS=1, BindingLayout.h: TableEligibility), set when the
 	// permutation is registered; not serialized. A TableRefusal, the SRT slot count and whether
 	// it reads flat or global memory.
@@ -732,7 +801,9 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
-
+	// Table mode (TablePlan, EnterTableMode).
+	bool                          table_mode = false;
+	TablePlan                     table_plan;
 };
 
 std::string ProgramToString(const Program& program);

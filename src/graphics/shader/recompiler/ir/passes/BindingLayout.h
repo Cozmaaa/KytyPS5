@@ -5,6 +5,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+struct ResourceSpecialization;
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
                       bool lds_storage = false);
 
@@ -18,9 +20,10 @@ bool UsesFlattenedSrt(const Program& program);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
-// Table mode census (KYTY_TABLE_CENSUS=1): whether a program could be compiled in the Demon's
-// Souls fork's table mode (github.com/chenxiao07/KytyPS5, IR::EnterTableMode), checked on the
-// resource plan with the same rules; nothing is compiled. table-mode-port-plan.md, step 0.
+// Table mode (TablePlan; the Demon's Souls fork's, github.com/chenxiao07/KytyPS5): whether a
+// program can be compiled in table mode, and why not. The census (KYTY_TABLE_CENSUS=1,
+// table-mode-port-plan.md step 0) checks registered permutations with the same function the
+// translation builds its plan with (BuildTablePlan), so the two never disagree.
 enum class TableRefusal : uint8_t {
 	Unknown = 0, // not checked
 	Eligible,
@@ -35,6 +38,9 @@ enum class TableRefusal : uint8_t {
 	DynamicMip,         // an image of dynamic mip levels
 	WrittenImage,       // a vertex shader that writes an image, or an atomic image
 	ImageDescriptor,    // an image descriptor of neither 4 nor 8 dwords
+	Stage,              // not a vertex, pixel or compute program
+	WriteTracked,       // a buffer written at addresses the host cannot bound (write bitmap)
+	ShaderData,         // the shader data do not fit the push constants (CompileProgram only)
 	Count
 };
 const char* TableRefusalName(TableRefusal refusal);
@@ -43,8 +49,21 @@ struct TableEligibilityResult {
 	uint16_t     slots   = 0;
 	bool         global  = false; // flat or global memory reads (table mode readies their BDA ranges)
 };
-TableEligibilityResult TableEligibility(const ResourcePlan& plan);
+// The checks and, with `out`, the plan (slot and descriptor operands; MarkTableSlots marks the
+// slot sets later). A plan of a source with a permutation's `specialization`, or a program with
+// its specialization applied (null), decide alike.
+TableEligibilityResult BuildTablePlan(const ResourcePlan& program,
+                                      const ResourceSpecialization* specialization, TablePlan* out);
+TableEligibilityResult TableEligibility(const ResourcePlan&           plan,
+                                        const ResourceSpecialization* specialization = nullptr);
 bool                   TableCensusEnabled();
+
+// After ApplyResourceSpecialization, while the plan's values are still there: the program's plan
+// (Program::table_plan) and table mode, or why not (the program is unchanged then).
+TableRefusal EnterTableMode(Program& program);
+// After dead code elimination: the slots the shader reads (TablePlan::gpu) and those the host
+// evaluates (TablePlan::cpu).
+void MarkTableSlots(Program& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

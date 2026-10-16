@@ -61,7 +61,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
 	const auto shared = IR::CollectMemoryResources(program, buffers);
-	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
+	// Table mode reads its buffers and slots by device address (IR::TablePlan).
+	const bool table = program.table_mode;
+	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty() && !table;
 	if (shared.gds) {
 		Expect(Kind::Gds);
 	}
@@ -72,7 +74,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	if (IR::UsesFlattenedSrt(program)) {
+	if (IR::UsesFlattenedSrt(program) && !table) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
@@ -102,7 +104,11 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
 	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
-	    program.bindings.memory_offset_count != buffers.size() ||
+	    program.bindings.memory_offset_count != (table ? 0u : buffers.size()) ||
+	    program.bindings.table_block_dwords != (table ? 2u : 0u) ||
+	    (table && (program.bindings.write_tracking ||
+	               program.table_plan.buffers.size() != program.info.buffers.size() ||
+	               program.table_plan.gpu.size() != program.srt_reads.size())) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

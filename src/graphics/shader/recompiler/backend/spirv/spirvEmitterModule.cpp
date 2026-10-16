@@ -195,7 +195,7 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
-	       state.program.bindings.write_tracking;
+	       state.program.bindings.write_tracking || state.program.table_mode;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {

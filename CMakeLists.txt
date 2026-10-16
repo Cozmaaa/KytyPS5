@@ -555,6 +555,10 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
 # Offline replay of the shader disk cache's recorded permutations; a tool, not a test.
 add_kyty_full_emulator_test(shader_cache_replay_tool "${KYTY_TESTS_DIR}/ShaderCacheReplayTool.cpp")
+add_kyty_full_emulator_test(shader_table_mode_tests "${KYTY_TESTS_DIR}/ShaderTableModeTests.cpp")
+# UFC 5's shader disk cache folder (_ShaderCache/PPSA03541) for shader_table_mode_tests' recorded
+# shaders; without it that part is skipped.
+set(KYTY_UFC_SHADER_CACHE "" CACHE PATH "UFC 5 shader disk cache folder for shader_table_mode_tests")
 if(KYTY_CLANG_CL)
 	# Symbols for the stack it prints when a shader crashes it.
 	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"
@@ -815,6 +819,11 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_table_mode COMMAND $<TARGET_FILE:shader_table_mode_tests>)
+	if (KYTY_UFC_SHADER_CACHE)
+		set_tests_properties(shader_table_mode PROPERTIES
+			ENVIRONMENT "KYTY_UFC_SHADER_CACHE=${KYTY_UFC_SHADER_CACHE}")
+	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -895,6 +904,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_table_mode_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests

@@ -137,9 +137,11 @@ void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info);
 void AppendSpecialization(ByteWriter& key, const ShaderRecompiler::IR::ResourceSpecialization& value);
 // Offline tools (shader_cache_replay_tool): a specialization as AppendSpecialization wrote it, and
 // an entry file's key and payload (the payload checked against its hash, the key not compared).
+// With `format_version`, a file of another format version is read too (its keys encode alike up
+// to the session's format; its payload may not decode).
 [[nodiscard]] bool ReadSpecialization(ByteReader& key, ShaderRecompiler::IR::ResourceSpecialization& value);
 [[nodiscard]] bool ReadEntryFile(const std::filesystem::path& path, std::vector<uint8_t>& key,
-                                 std::vector<uint8_t>& payload);
+                                 std::vector<uint8_t>& payload, uint32_t* format_version = nullptr);
 
 struct SourceRecord {
 	bool                             unsupported = false;

@@ -134,8 +134,13 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
+	// By descriptor array index; in table mode by buffer (EmitTableMode).
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// Table mode (IR::TablePlan, EmitTableMode): the value of each slot the shader reads (0: not
+	// read) and each live buffer's device address (u64 ids), at the function's entry.
+	std::vector<uint32_t>                            table_slot_values;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_buffer_bases {};
 	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
 	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
 	// instruction being emitted writes memory.
@@ -455,6 +460,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+void EmitTableMode(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
@@ -468,7 +474,17 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
 	uint32_t              write_base       = 0;
+	// Table mode: the buffer's device address (u64 id; object_pointer is unused). A load or
+	// store through its element pointers takes the Aligned operand (AlignedMemoryAccess).
+	uint32_t              bda_base         = 0;
 };
+
+// Table mode: the memory operand mask of a load or store of an access's elements, which a
+// physical pointer requires to state the element's alignment (the operand after it).
+inline uint32_t AlignedMemoryAccess(const MemoryResourceAccess& access) {
+	return static_cast<uint32_t>(access.memory_access) |
+	       static_cast<uint32_t>(spv::MemoryAccessAlignedMask);
+}
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
