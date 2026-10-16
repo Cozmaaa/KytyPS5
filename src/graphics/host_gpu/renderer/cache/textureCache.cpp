@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -214,6 +215,14 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 
 } // namespace
 
+// KYTY_GPU_CLEAR_CHECK, per A/B arm (common/abSwitch.h): 0 is off, unset or 1-3 on.
+static const Common::AbSwitch<bool>& ClearCheckSwitch() {
+	static const Common::AbSwitch<bool> value("KYTY_GPU_CLEAR_CHECK", [](const char* v) {
+		return v == nullptr || v[0] == '1' || v[0] == '2' || v[0] == '3';
+	});
+	return value;
+}
+
 // KYTY_TEXTURE_CACHE_MB / KYTY_BUFFER_CACHE_MB: an upper bound for a cache's collection thresholds,
 // whatever the card's size (default 6 GiB each; 0 = no bound). The thresholds otherwise follow the
 // device budget, and on a 32 GB card the caches kept everything up to ~25 GB: textures and buffers
@@ -255,8 +264,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// times a frame (~7.5 ms each, a CMask a compute pass rewrites); on the GPU, DrawAuto 155 -> 8.5
 	// us a call, screenshots the same, and by scene (the CPU fight is either on the mat, few draws,
 	// or standing with the crowd in view) ground ~37 fps against 33, standing ~28 against ~25.
-	if (const char* value = std::getenv("KYTY_GPU_CLEAR_CHECK");
-	    value == nullptr || value[0] == '1' || value[0] == '2' || value[0] == '3') {
+	if (ClearCheckSwitch().Get(0) || ClearCheckSwitch().Get(1)) {
 		if (m_graphics.conditional_rendering_enabled) {
 			m_clear_check = std::make_unique<ColorClearCheck>(graphics, scheduler);
 		}
@@ -350,6 +358,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
+	++m_image_set_epoch;
 	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
@@ -385,6 +394,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	++m_image_set_epoch;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1358,7 +1368,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// GPU-written metadata no known fill accounts for: check it on the GPU instead of draining
 	// (KYTY_GPU_CLEAR_CHECK=1, ColorClearCheck).
-	if (!all_known && m_clear_check != nullptr && !volume_texture &&
+	if (!all_known && m_clear_check != nullptr && ClearCheckSwitch().Get() && !volume_texture &&
 	    m_buffer_cache.IsRegionGpuModified(range.address, range.size) &&
 	    m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
 		const auto checked_address = range.address + slice_size * first;
@@ -1688,14 +1698,41 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		// The page-table search below, per page every image on it, was ~10 % of the GPU thread in
+		// UFC 5 fights (host sampler) for lookups that find the same image each frame.
+		static const Common::AbSwitch<bool> memo_switch("KYTY_FIND_IMAGE_MEMO", [](const char* value) {
+			return value == nullptr || value[0] != '0';
+		});
+		const bool memo_enabled = memo_switch.Get();
+		if (memo_enabled && m_find_image_memo.empty()) {
+			m_find_image_memo.resize(FindImageMemoEntries);
+		}
+		const auto memo_index =
+		    (desc.info.data.address * 0x9e3779b97f4a7c15ull ^ desc.info.data.size ^
+		     static_cast<uint64_t>(desc.info.pixel_format) << 7u ^ static_cast<uint64_t>(desc.info.type) << 3u) >>
+		    52u;
+		FindImageMemo* memo = memo_enabled ? &m_find_image_memo[memo_index % FindImageMemoEntries] : nullptr;
+		if (memo != nullptr && memo->epoch == m_image_set_epoch && memo->address == desc.info.data.address &&
+		    memo->size == desc.info.data.size && memo->format == desc.info.pixel_format &&
+		    memo->type == static_cast<uint32_t>(desc.info.type) && memo->exact == exact_format) {
+			if (const auto* image = m_slot_images.try_get(memo->id);
+			    image != nullptr && image->registered && SameBacking(image->info, desc.info, exact_format)) {
+				result = memo->id;
+			}
+		}
+		const bool memo_hit = static_cast<bool>(result);
+		const auto candidates =
+		    memo_hit ? ImageIds {} : FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
+		}
+		if (memo != nullptr && !memo_hit && result) {
+			*memo = {m_image_set_epoch, desc.info.data.address, desc.info.data.size, result,
+			         desc.info.pixel_format, static_cast<uint32_t>(desc.info.type), exact_format};
 		}
 
 		int32_t view_mip   = -1;

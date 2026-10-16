@@ -1,3 +1,4 @@
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1209,6 +1210,7 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
+		Common::AbOnFrame();
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

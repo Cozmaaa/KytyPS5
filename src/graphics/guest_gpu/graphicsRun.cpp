@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
+#include "common/hostSampler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -236,10 +237,14 @@ bool GuestGpu::LabelsDeferred() noexcept {
 	return g_labels_deferred.load(std::memory_order_relaxed);
 }
 
+// On by default (KYTY_LABELS_AT_COMPLETION=0: written when translated). A label written before the
+// GPU ran the work it guards lets the game reuse that work's data early: in UFC 5 fights, with the
+// GPU thread faster (FindImage memo), fighters' meshes and textures tore. 2026-10-16, fight route,
+// standing: up to ~5 % slower without the memo (27 fps against 29), and with it 29-31 fps, correct.
 bool GuestGpu::LabelsAtCompletion() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_LABELS_AT_COMPLETION");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
@@ -669,6 +674,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_tracker_on_gpu_thread = true;
+	Common::SampleCurrentThread("GPU thread");
 	g_gpu_state  = gpu;
 
 	for (;;) {

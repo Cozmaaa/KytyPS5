@@ -262,6 +262,20 @@ private:
 	// stretch without presents (a loading screen) still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// FindImage's result for a description (KYTY_FIND_IMAGE_MEMO=0: off): valid while no image was
+	// registered or unregistered since (m_image_set_epoch), and checked with SameBacking again.
+	struct FindImageMemo {
+		uint64_t   epoch   = 0;
+		uint64_t   address = 0;
+		uint64_t   size    = 0;
+		ImageId    id;
+		vk::Format format  = vk::Format::eUndefined;
+		uint32_t   type    = 0;
+		bool       exact   = false;
+	};
+	static constexpr size_t            FindImageMemoEntries = 4096;
+	std::vector<FindImageMemo>         m_find_image_memo;
+	uint64_t                           m_image_set_epoch = 1;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

@@ -9,6 +9,7 @@
 #include <windows.h>
 #endif
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -101,6 +102,11 @@ bool SDLCALL DiagnosticInputMessage(void* userdata, MSG* message) {
 	    SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
 	if (message->message != g_diagnostic_key_message || message->hwnd != hwnd) {
 		return true;
+	}
+	if (message->lParam == 2) {
+		// Starts an in-run A/B (common/abSwitch.h).
+		Common::AbStart();
+		return false;
 	}
 	if (message->lParam != 0 && message->lParam != 1) {
 		return false;

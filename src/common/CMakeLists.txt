@@ -30,7 +30,7 @@ target_link_libraries(common
 		nlohmann_json::nlohmann_json
 )
 if (WIN32)
-	target_link_libraries(common PRIVATE dbghelp)
+	target_link_libraries(common PRIVATE dbghelp winmm psapi)
 endif()
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1103,6 +1104,7 @@ private:
 	}
 
 	void Record(int64_t ns) {
+		Common::AbRecordDraw(static_cast<uint64_t>(std::max<int64_t>(ns, 0)));
 		auto&      w     = State();
 		const auto frame = static_cast<uint64_t>(m_buffer.GetContext().GetGpu().GetFrameNum());
 		if (w.first_frame == UINT64_MAX) {
