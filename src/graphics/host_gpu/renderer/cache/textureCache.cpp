@@ -1699,7 +1699,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	{
 		std::scoped_lock lock {m_lock};
 		// The page-table search below, per page every image on it, was ~10 % of the GPU thread in
-		// UFC 5 fights (host sampler) for lookups that find the same image each frame.
+		// UFC 5 fights (host sampler) for lookups that find the same image each frame. In-run A/B,
+		// 2026-10-16, standing fight: +4.2 % fps (+-0.7), 9.8 against 10.7 us a draw. Needs labels
+		// written at completion (LabelsAtCompletion): with early labels, fighters' meshes tore.
 		static const Common::AbSwitch<bool> memo_switch("KYTY_FIND_IMAGE_MEMO", [](const char* value) {
 			return value == nullptr || value[0] != '0';
 		});
