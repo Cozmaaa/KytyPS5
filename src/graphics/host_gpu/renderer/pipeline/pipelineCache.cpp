@@ -973,7 +973,9 @@ struct PipelineCache::ProgramCache {
 			     program.bda_read_plan.complete ? 1 : 0, spans.c_str());
 		}
 		if (ShaderRecompiler::IR::TableCensusEnabled()) {
-			const auto census     = ShaderRecompiler::IR::TableEligibility(source.resource_plan);
+			// With the permutation's specialization: what table mode would decide for it.
+			const auto census     = ShaderRecompiler::IR::TableEligibility(source.resource_plan,
+			                                                               &source.specialization);
 			program.table_refusal = static_cast<uint8_t>(census.refusal);
 			program.table_slots   = census.slots;
 			program.table_global  = census.global;

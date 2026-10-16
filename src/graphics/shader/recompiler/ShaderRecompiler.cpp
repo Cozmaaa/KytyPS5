@@ -785,6 +785,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// Table mode reads the plan's descriptor and SRT values, which the loop below drops.
+	if (options.table_mode) {
+		if (const auto refusal = IR::EnterTableMode(ir); refusal != IR::TableRefusal::Eligible) {
+			CompileResult refused;
+			refused.table_refusal = refusal;
+			return refused;
+		}
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -823,9 +831,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	IR::MarkTableSlots(ir);
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
 	                         options.input_info.compute->lds_storage);
+	// A table mode draw's shader data, the block's address among them, are push constants.
+	if (ir.table_mode && ir.bindings.ShaderDataDwords() != 0 && !ir.bindings.UsesPushData()) {
+		CompileResult refused;
+		refused.table_refusal = IR::TableRefusal::ShaderData;
+		return refused;
+	}
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
@@ -846,6 +861,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	if (ir.table_mode) {
+		result.table_refusal = IR::TableRefusal::Eligible;
+	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
 	if (options.dump_ir) {

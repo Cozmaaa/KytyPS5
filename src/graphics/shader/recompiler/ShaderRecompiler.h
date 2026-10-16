@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -21,6 +22,8 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;
+	// Compile in table mode (IR::TablePlan, IR::EnterTableMode); off in the renderer for now.
+	bool                        table_mode                 = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
@@ -34,6 +37,8 @@ struct TranslateResult {
 };
 
 struct CompileResult {
+	// Table mode: Eligible, or why the program was refused (then nothing was compiled).
+	IR::TableRefusal       table_refusal = IR::TableRefusal::Unknown;
 	std::vector<uint32_t>  spirv;
 	std::string            decoded_dump;
 	std::string            ir_dump;

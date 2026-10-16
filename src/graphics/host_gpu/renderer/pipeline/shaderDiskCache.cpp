@@ -24,8 +24,9 @@ namespace IR = ShaderRecompiler::IR;
 namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
-// file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 2;
+// file too, so this is belt and braces). 3: table mode (BindingLayout::table_block_dwords,
+// CompiledShaderInfo::table_mode and table_plan).
+constexpr uint32_t FormatVersion = 3;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -222,8 +223,46 @@ void Visit(Io& io, T& v) {
 	io(v.memory_offset_dword);
 	io(v.memory_offset_count);
 	io(v.write_tracking);
+	io(v.table_block_dwords);
 	io(v.user_data_registers);
 	io(v.descriptors);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::TablePlan::Operand>
+void Visit(Io& io, T& v) {
+	io(v.kind);
+	io(v.value);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::TablePlan::Slot>
+void Visit(Io& io, T& v) {
+	io(v.low);
+	io(v.high);
+	io(v.offset);
+	io(v.immediate);
+	io(v.records);
+	io(v.bounded);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::TablePlan::Descriptor>
+void Visit(Io& io, T& v) {
+	io(v.words);
+	io(v.count);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::TablePlan>
+void Visit(Io& io, T& v) {
+	io(v.slots);
+	io(v.buffers);
+	io(v.images);
+	io(v.samplers);
+	io(v.gpu);
+	io(v.cpu);
+	io(v.global_memory);
 }
 
 template <typename Io, typename T>
@@ -240,6 +279,8 @@ void Visit(Io& io, T& v) {
 	io(v.info);
 	io(v.bindings);
 	io(v.bda_read_plan);
+	io(v.table_mode);
+	io(v.table_plan);
 }
 
 template <typename Io, typename T>
@@ -407,7 +448,11 @@ static_assert(sizeof(IR::DescriptorBinding) == 32);
 static_assert(sizeof(IR::BindingLayout) == 72);
 // (table_refusal, table_slots and table_global are not serialized: AddPermutation sets them.)
 static_assert(sizeof(IR::BdaReadPlan) == 32);
-static_assert(sizeof(IR::CompiledShaderInfo) == 344);
+static_assert(sizeof(IR::TablePlan::Operand) == 8);
+static_assert(sizeof(IR::TablePlan::Slot) == 40);
+static_assert(sizeof(IR::TablePlan::Descriptor) == 68);
+static_assert(sizeof(IR::TablePlan) == 152);
+static_assert(sizeof(IR::CompiledShaderInfo) == 504);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);
@@ -834,6 +879,40 @@ void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info) {
 void AppendSpecialization(ByteWriter& key, const IR::ResourceSpecialization& value) {
 	Writer writer {.out = key};
 	writer(value);
+}
+
+bool ReadSpecialization(ByteReader& key, IR::ResourceSpecialization& value) {
+	Reader reader {.in = key};
+	reader(value);
+	return key.Ok();
+}
+
+bool ReadEntryFile(const std::filesystem::path& path, std::vector<uint8_t>& key,
+                   std::vector<uint8_t>& payload, uint32_t* format_version) {
+	std::vector<uint8_t> file;
+	if (!ReadFile(path, file)) {
+		return false;
+	}
+	ByteReader reader(file);
+	uint32_t   magic        = 0;
+	uint32_t   format       = 0;
+	uint64_t   key_size     = 0;
+	uint64_t   payload_size = 0;
+	uint64_t   payload_hash = 0;
+	constexpr size_t header = sizeof(magic) + sizeof(format) + 3 * sizeof(uint64_t);
+	if (!reader.Get(magic) || !reader.Get(format) || !reader.Get(key_size) ||
+	    !reader.Get(payload_size) || !reader.Get(payload_hash) || magic != FileMagic ||
+	    (format_version == nullptr && format != FormatVersion) || key_size > file.size() - header ||
+	    payload_size != file.size() - header - key_size ||
+	    XXH3_64bits(file.data() + header + key_size, payload_size) != payload_hash) {
+		return false;
+	}
+	if (format_version != nullptr) {
+		*format_version = format;
+	}
+	key.assign(file.begin() + header, file.begin() + static_cast<std::ptrdiff_t>(header + key_size));
+	payload.assign(file.begin() + static_cast<std::ptrdiff_t>(header + key_size), file.end());
+	return true;
 }
 
 bool EncodeSourceRecord(bool unsupported, bool uses_clock, const IR::ResourcePlan* plan,

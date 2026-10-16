@@ -131,6 +131,50 @@ void EmitMemoryOffsets(EmitterState& state) {
 			state.write_track_bases[i] = load64(start + 2u + 2u * i);
 		}
 	}
+	if (state.program.table_mode) {
+		EmitTableMode(state);
+	}
+}
+
+// Table mode (IR::TablePlan), at the function's entry: from the block (its device address is
+// shader data), the slots the shader reads, and each live buffer's device address, length in
+// dwords and byte offset, which stand in for a binding's (memory_dword_lengths and
+// memory_byte_offsets, by buffer).
+void EmitTableMode(EmitterState& state) {
+	const auto& program = state.program;
+	const auto& plan    = program.table_plan;
+	const auto  u64     = TypeScalarU64(state);
+	const auto  block   = DeviceAddressFromWords(
+        state, EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword()),
+        EmitShaderDataDwordLoad(state, program.bindings.TableBlockDword() + 1u));
+	const auto load = [&](uint32_t dword) {
+		const auto pointer =
+		    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+		          Binary(state, spv::OpIAdd, u64, block,
+		                 ConstantDeviceAddress(state, uint64_t {dword} * sizeof(uint32_t))));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
+		return value;
+	};
+	state.table_slot_values.assign(plan.slots.size(), 0);
+	for (uint32_t slot = 0; slot < plan.slots.size() && slot < plan.gpu.size(); slot++) {
+		if (plan.gpu[slot] != 0) {
+			state.table_slot_values[slot] = load(slot);
+		}
+	}
+	std::vector<uint32_t> buffers;
+	(void)IR::CollectMemoryResources(program, buffers);
+	for (const auto resource: buffers) {
+		if (resource >= plan.buffers.size()) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, resource,
+			                             "table mode plan has no such buffer");
+		}
+		const auto first                        = plan.BufferDword(resource);
+		state.table_buffer_bases.at(resource)   = DeviceAddressFromWords(state, load(first), load(first + 1u));
+		state.memory_dword_lengths.at(resource) = load(first + 2u);
+		state.memory_byte_offsets.at(resource)  = load(first + 3u);
+	}
 }
 
 // Rework Phase 2, first step: a store or atomic through a write-tracked binding sets the bit of
@@ -248,21 +292,39 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          uint32_t variable,
                                                          uint32_t pointer_type,
                                                          uint32_t element_bits) {
-	if (variable == 0) {
+	const bool table = state.program.table_mode;
+	if (variable == 0 && !table) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
+	// Table mode: the buffer by its device address (EmitTableMode), its offsets and lengths by
+	// buffer.
 	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	    table ? mem.resource
+	          : ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 	MemoryResourceAccess access {
 	    .kind          = mem.kind,
 	    .element_bits  = element_bits,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
-	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
+	if (table) {
+		if (mem.resource >= state.table_buffer_bases.size() ||
+		    state.table_buffer_bases[mem.resource] == 0) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "table mode buffer was not loaded at the entry");
+		}
+		access.bda_base = state.table_buffer_bases[mem.resource];
+		// The normal path's buffers are Coherent when any access is (GLC), so that its stores
+		// reach other invocations' GLC loads. A device address cannot be decorated.
+		if (state.emitting_write && state.requirements.coherent_buffers) {
+			access.memory_access = spv::MemoryAccessVolatileMask;
+		}
+	} else {
+		access.object_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer,
+		                          variable, ConstantU32(state, array_index));
+	}
 	access.byte_offset = state.memory_byte_offsets[array_index];
-	if (state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
+	if (!table && state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
 	    state.program.bindings.write_tracking && mem.resource < state.program.info.buffers.size() &&
 	    state.program.info.buffers[mem.resource].write_tracked) {
 		access.write_base = state.write_track_bases[array_index];
@@ -332,7 +394,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			                      : bits == 16u ? state.storage_buffer_u16_variable
 			                                    : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits), bits);
+			    state, mem, variable,
+			    state.program.table_mode ? 0u : TypeStorageBufferPointer(state, bits), bits);
 			access.element_bits = bits;
 			return access;
 		}
@@ -367,6 +430,9 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		                          pointer, access.object_pointer, index);
 		return pointer;
 	}
+	if (access.bda_base != 0) {
+		return EmitStorageBufferElementPointer(state, access, index, 0);
+	}
 	return EmitStorageBufferElementPointer(state, access, index,
 	                                       TypeStorageBufferElementPointer(state, access.element_bits));
 }
@@ -374,6 +440,20 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.bda_base != 0) {
+		// Table mode: element `index` (of the access's width) past the buffer's device address.
+		const auto u64   = TypeScalarU64(state);
+		const auto shift = std::countr_zero(std::max(access.element_bits / 8u, 1u));
+		auto       bytes = Unary(state, spv::OpUConvert, u64, index);
+		if (shift != 0) {
+			bytes = Binary(state, spv::OpShiftLeftLogical, u64, bytes,
+			               ConstantDeviceAddress(state, static_cast<uint64_t>(shift)));
+		}
+		return Unary(state, spv::OpConvertUToPtr,
+		             TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+		                         TypeStorageBufferElement(state, access.element_bits)),
+		             Binary(state, spv::OpIAdd, u64, access.bda_base, bytes));
+	}
 	if (access.write_base != 0) {
 		EmitWriteBitmapMark(state, access, index);
 	}

@@ -150,6 +150,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .table_mode      = table_mode,
+	    .table_plan      = std::move(table_plan),
 	};
 	result.bda_read_plan = std::move(bda_read_plan);
 	for (const auto& output: result.info.outputs) {

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
 #include <array>
@@ -126,15 +127,19 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	std::vector<uint32_t> buffers;
 	const auto shared = CollectMemoryResources(program, buffers);
 	CollectShaderData(program, next);
-	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
-	next.write_tracking            = std::ranges::any_of(buffers, [&](uint32_t resource) {
+	// Table mode reads its buffers' ranges and its slots from its block (TablePlan): no memory
+	// offsets or lengths in the shader data, no buffer or flattened SRT bindings.
+	const bool table = program.table_mode;
+	next.memory_offset_count       = table ? 0u : static_cast<uint32_t>(buffers.size());
+	next.write_tracking            = !table && std::ranges::any_of(buffers, [&](uint32_t resource) {
 		           return resource < program.info.buffers.size() &&
 		                  program.info.buffers[resource].write_tracked;
 	           });
+	next.table_block_dwords    = table ? 2u : 0u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
-	if (!buffers.empty()) {
+	if (!buffers.empty() && !table) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
 		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffers));
 	}
@@ -182,7 +187,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	if (UsesFlattenedSrt(program)) {
+	if (UsesFlattenedSrt(program) && !table) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
@@ -205,14 +210,15 @@ const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBind
 
 namespace {
 
+using TableKind = TablePlan::Operand::Kind;
+
 // A value table mode evaluates at the program's entry: an immediate, user data or an SRT slot
 // below `slots`, or a phi of one of them alone (the fork's TableOperand / TablePhiOperand).
-// Returns an encoding of the operand (kind << 32 | value) for comparing phi inputs.
-std::optional<uint64_t> TableOperand(Value value, size_t slots);
+std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots);
 
-std::optional<uint64_t> TablePhiOperand(const Inst& phi, size_t slots) {
-	std::optional<uint64_t>  common;
-	std::vector<const Inst*> pending {&phi}, seen;
+std::optional<TablePlan::Operand> TablePhiOperand(const Inst& phi, size_t slots) {
+	std::optional<TablePlan::Operand> common;
+	std::vector<const Inst*>          pending {&phi}, seen;
 	while (!pending.empty()) {
 		const auto* current = pending.back();
 		pending.pop_back();
@@ -240,13 +246,13 @@ std::optional<uint64_t> TablePhiOperand(const Inst& phi, size_t slots) {
 	return common;
 }
 
-std::optional<uint64_t> TableOperand(Value value, size_t slots) {
+std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
 		if (value.GetType() != Type::U32) {
 			return std::nullopt;
 		}
-		return uint64_t {value.U32()};
+		return TablePlan::Operand {TableKind::Immediate, value.U32()};
 	}
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
@@ -256,7 +262,8 @@ std::optional<uint64_t> TableOperand(Value value, size_t slots) {
 		return TablePhiOperand(*inst, slots);
 	}
 	if (inst->GetOpcode() == ValueOpcode::GetUserData && inst->Arg(0).GetType() == Type::ScalarReg) {
-		return uint64_t {1} << 32u | RegIndex(inst->Arg(0).ScalarRegister());
+		return TablePlan::Operand {TableKind::UserData,
+		                           static_cast<uint32_t>(RegIndex(inst->Arg(0).ScalarRegister()))};
 	}
 	if (inst->GetOpcode() != ValueOpcode::ReadConst) {
 		return std::nullopt;
@@ -265,11 +272,10 @@ std::optional<uint64_t> TableOperand(Value value, size_t slots) {
 	if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= slots) {
 		return std::nullopt;
 	}
-	return uint64_t {2} << 32u | slot.U32();
+	return TablePlan::Operand {TableKind::Slot, slot.U32()};
 }
 
-// A value of the stage's code address and immediates alone: a V# of constants the code embeds
-// (the fork proves the offset by evaluation; the census only checks the shape).
+// A value of the stage's code address and immediates alone: a V# of constants the code embeds.
 bool OfShaderBaseOnly(Value value, uint32_t depth = 0) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
@@ -314,6 +320,117 @@ bool OfShaderBaseOnly(Value value, uint32_t depth = 0) {
 	}
 }
 
+// An OfShaderBaseOnly value with the code at `base` (the SRT walker's arithmetic).
+std::optional<uint64_t> EvaluateAtShaderBase(Value value, uint64_t base, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		switch (value.GetType()) {
+			case Type::U1: return uint64_t {value.U1()};
+			case Type::U32: return uint64_t {value.U32()};
+			case Type::U64: return value.U64();
+			default: return std::nullopt;
+		}
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 32) {
+		return std::nullopt;
+	}
+	const auto op = inst->GetOpcode();
+	if (op == ValueOpcode::GetShaderBase) {
+		return base;
+	}
+	if (op == ValueOpcode::CompositeExtractU64 || op == ValueOpcode::CompositeExtractU32x2) {
+		const auto index = inst->Arg(1).Resolve();
+		if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+			return std::nullopt;
+		}
+		const auto component = index.U32();
+		if (op == ValueOpcode::CompositeExtractU64) {
+			const auto packed = EvaluateAtShaderBase(inst->Arg(0), base, depth + 1);
+			if (!packed) {
+				return std::nullopt;
+			}
+			return uint64_t {static_cast<uint32_t>(*packed >> (32u * component))};
+		}
+		const auto* source = inst->Arg(0).ResolveInstruction();
+		if (source != nullptr && source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+			return EvaluateAtShaderBase(source->Arg(component), base, depth + 1);
+		}
+		if (source != nullptr && source->GetOpcode() == ValueOpcode::IAddCarry32) {
+			const auto lhs = EvaluateAtShaderBase(source->Arg(0), base, depth + 1);
+			const auto rhs = EvaluateAtShaderBase(source->Arg(1), base, depth + 1);
+			if (!lhs || !rhs) {
+				return std::nullopt;
+			}
+			const auto sum = uint64_t {static_cast<uint32_t>(*lhs)} + static_cast<uint32_t>(*rhs);
+			return uint64_t {static_cast<uint32_t>(component == 0u ? sum : sum >> 32u)};
+		}
+		return std::nullopt;
+	}
+	std::array<uint64_t, 3> v {};
+	if (inst->NumArgs() > v.size()) {
+		return std::nullopt;
+	}
+	for (size_t i = 0; i < inst->NumArgs(); ++i) {
+		const auto arg = EvaluateAtShaderBase(inst->Arg(i), base, depth + 1);
+		if (!arg) {
+			return std::nullopt;
+		}
+		v[i] = *arg;
+	}
+	const auto a = v[0];
+	const auto b = v[1];
+	const auto u32 = [](uint64_t x) { return uint64_t {static_cast<uint32_t>(x)}; };
+	switch (op) {
+		case ValueOpcode::Identity: return a;
+		case ValueOpcode::CompositeConstructU64: return u32(a) | u32(b) << 32u;
+		case ValueOpcode::IAdd32: return u32(a + b);
+		case ValueOpcode::IAdd64: return a + b;
+		case ValueOpcode::ISub32: return u32(a - b);
+		case ValueOpcode::ISub64: return a - b;
+		case ValueOpcode::BitwiseAnd32: return u32(a & b);
+		case ValueOpcode::BitwiseAnd64: return a & b;
+		case ValueOpcode::BitwiseOr32: return u32(a | b);
+		case ValueOpcode::BitwiseXor32: return u32(a ^ b);
+		case ValueOpcode::ShiftLeftLogical32: return u32(u32(a) << (b & 31u));
+		case ValueOpcode::ShiftRightLogical32: return u32(a) >> (b & 31u);
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectU32: return a != 0u ? b : v[2];
+		case ValueOpcode::IEqual32: return uint64_t {u32(a) == u32(b)};
+		case ValueOpcode::INotEqual32: return uint64_t {u32(a) != u32(b)};
+		case ValueOpcode::ULessThan32: return uint64_t {u32(a) < u32(b)};
+		case ValueOpcode::LogicalOr: return uint64_t {a != 0u || b != 0u};
+		case ValueOpcode::LogicalAnd: return uint64_t {a != 0u && b != 0u};
+		default: return std::nullopt;
+	}
+}
+
+// A descriptor's base address dwords (`low`, `high`) as the stage's code address plus an offset
+// below 2^31: proven by evaluating them at code addresses whose low dword carries into the high
+// one too (the fork's ShaderBaseOffset).
+std::optional<uint32_t> ShaderBaseOffset(Value low, Value high) {
+	if (!OfShaderBaseOnly(low) || !OfShaderBaseOnly(high)) {
+		return std::nullopt;
+	}
+	std::optional<uint32_t> offset;
+	for (const uint64_t base: {0x2'0000'0000ull, 0x2'ffff'ff00ull, 0x9'0271'be00ull,
+	                           0x7fff'ffff'ff00ull, 0x3'8000'0000ull}) {
+		const auto low_word  = EvaluateAtShaderBase(low, base);
+		const auto high_word = EvaluateAtShaderBase(high, base);
+		if (!low_word || !high_word) {
+			return std::nullopt;
+		}
+		const auto address = uint64_t {static_cast<uint32_t>(*low_word)} |
+		                     uint64_t {static_cast<uint32_t>(*high_word)} << 32u;
+		if (address < base || address - base >= 0x8000'0000ull ||
+		    (offset && *offset != address - base)) {
+			return std::nullopt;
+		}
+		offset = static_cast<uint32_t>(address - base);
+	}
+	return offset;
+}
+
 } // namespace
 
 const char* TableRefusalName(TableRefusal refusal) {
@@ -331,6 +448,9 @@ const char* TableRefusalName(TableRefusal refusal) {
 		case TableRefusal::DynamicMip: return "dynamic mip";
 		case TableRefusal::WrittenImage: return "written/atomic image";
 		case TableRefusal::ImageDescriptor: return "image descriptor size";
+		case TableRefusal::Stage: return "stage";
+		case TableRefusal::WriteTracked: return "write-tracked buffer";
+		case TableRefusal::ShaderData: return "shader data not in push constants";
 		default: return "?";
 	}
 }
@@ -343,14 +463,21 @@ bool TableCensusEnabled() {
 	return enabled;
 }
 
-// The checks of the fork's EnterTableMode (BindingLayout.cpp there), without building the plan.
-TableEligibilityResult TableEligibility(const ResourcePlan& program) {
+// The checks of the fork's EnterTableMode (BindingLayout.cpp there) and, with `out`, the plan they
+// leave. One function, so that the census and the translation never disagree.
+TableEligibilityResult BuildTablePlan(const ResourcePlan& program,
+                                      const ResourceSpecialization* specialization, TablePlan* out) {
 	TableEligibilityResult result;
 	const auto refuse = [&](TableRefusal refusal) {
 		result.refusal = refusal;
 		return result;
 	};
+	TablePlan plan;
 	result.slots = static_cast<uint16_t>(std::min<size_t>(program.srt_reads.size(), UINT16_MAX));
+	if (program.stage != ShaderType::Vertex && program.stage != ShaderType::Pixel &&
+	    program.stage != ShaderType::Compute) {
+		return refuse(TableRefusal::Stage);
+	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete) {
 		return refuse(TableRefusal::IncompletePlan);
 	}
@@ -364,6 +491,9 @@ TableEligibilityResult TableEligibility(const ResourcePlan& program) {
 			default: break;
 		}
 	}
+	plan.global_memory = result.global;
+	// The flattened SRT's slots in order (a slot's address only depends on lower slots and user
+	// data).
 	const auto slots = program.srt_reads.size();
 	for (size_t slot = 0; slot < slots; ++slot) {
 		const auto* load = program.srt_reads[slot].value.Resolve().TryInstruction();
@@ -381,10 +511,18 @@ TableEligibilityResult TableEligibility(const ResourcePlan& program) {
 			    offset.GetType() != Type::U32) {
 				return refuse(TableRefusal::SlotNotScalarLoad);
 			}
-			if (!TableOperand(handle->Arg(0), slot) || !TableOperand(handle->Arg(1), slot) ||
-			    !TableOperand(handle->Arg(2), slot)) {
+			const auto low     = TableOperand(handle->Arg(0), slot);
+			const auto high    = TableOperand(handle->Arg(1), slot);
+			const auto records = TableOperand(handle->Arg(2), slot);
+			if (!low || !high || !records) {
 				return refuse(TableRefusal::SlotAddress);
 			}
+			plan.slots.push_back({.low       = *low,
+			                      .high      = *high,
+			                      .offset    = {TableKind::Immediate, offset.U32()},
+			                      .immediate = static_cast<int32_t>(memory.offset),
+			                      .records   = *records,
+			                      .bounded   = true});
 			continue;
 		}
 		if (load->GetOpcode() != ValueOpcode::LoadAddressU32 || load->NumArgs() != 4) {
@@ -397,12 +535,18 @@ TableEligibilityResult TableEligibility(const ResourcePlan& program) {
 		    handle->GetOpcode() != ValueOpcode::GetAddressResource || handle->NumArgs() != 2) {
 			return refuse(TableRefusal::SlotNotScalarLoad);
 		}
-		if (!TableOperand(handle->Arg(0), slot) || !TableOperand(handle->Arg(1), slot) ||
-		    !TableOperand(load->Arg(1), slot)) {
+		const auto low    = TableOperand(handle->Arg(0), slot);
+		const auto high   = TableOperand(handle->Arg(1), slot);
+		const auto offset = TableOperand(load->Arg(1), slot);
+		if (!low || !high || !offset) {
 			return refuse(TableRefusal::SlotAddress);
 		}
+		plan.slots.push_back({.low       = *low,
+		                      .high      = *high,
+		                      .offset    = *offset,
+		                      .immediate = static_cast<int32_t>(memory.offset)});
 	}
-	const auto words_ok = [&](uint32_t source_index, uint32_t count) {
+	const auto words_of = [&](uint32_t source_index, uint32_t count, auto& words) {
 		if (source_index >= program.descriptor_sources.size()) {
 			return TableRefusal::DescriptorWords;
 		}
@@ -413,33 +557,69 @@ TableEligibilityResult TableEligibility(const ResourcePlan& program) {
 		if (source.dword_count != count) {
 			return TableRefusal::DescriptorWords;
 		}
-		const bool embedded =
-		    count == 4 &&
+		// A V# of constants the code embeds (s_getpc_b64 plus an offset), in a compute or pixel
+		// shader: its base address words are the code address plus that offset.
+		std::optional<uint32_t> embedded;
+		if (count == 4 &&
 		    (program.stage == ShaderType::Compute || program.stage == ShaderType::Pixel) &&
-		    (!TableOperand(source.dwords[0], slots) || !TableOperand(source.dwords[1], slots)) &&
-		    OfShaderBaseOnly(source.dwords[0]) && OfShaderBaseOnly(source.dwords[1]);
-		for (uint32_t i = embedded ? 2u : 0u; i < count; ++i) {
-			if (!TableOperand(source.dwords[i], slots)) {
+		    (!TableOperand(source.dwords[0], slots) || !TableOperand(source.dwords[1], slots))) {
+			embedded = ShaderBaseOffset(source.dwords[0], source.dwords[1]);
+		}
+		for (uint32_t i = 0; i < count; ++i) {
+			if (embedded && i < 2) {
+				words[i] = {i == 0 ? TableKind::ShaderBaseLow : TableKind::ShaderBaseHigh, *embedded};
+				continue;
+			}
+			const auto word = TableOperand(source.dwords[i], slots);
+			if (!word) {
 				return TableRefusal::DescriptorWords;
 			}
+			words[i] = *word;
 		}
 		return TableRefusal::Eligible;
 	};
-	for (const auto& buffer: program.info.buffers) {
-		if (buffer.indirect_root != BufferResource::NoIndirectBuffer) {
+	// A permutation's resources are the plan's with its specialization applied
+	// (ApplyResourceSpecialization), which can add indirect buffers and images and make images or
+	// samplers bindless.
+	if (specialization != nullptr && specialization->buffers.size() > program.info.buffers.size()) {
+		return refuse(TableRefusal::IndirectBuffer);
+	}
+	if (specialization != nullptr && specialization->images.size() > program.info.images.size()) {
+		return refuse(TableRefusal::IndirectDescriptor);
+	}
+	for (size_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& buffer = program.info.buffers[i];
+		const auto* spec   = specialization != nullptr && i < specialization->buffers.size()
+		                         ? &specialization->buffers[i]
+		                         : nullptr;
+		const auto  stride = spec != nullptr ? spec->packed_stride : buffer.packed_stride;
+		if ((spec != nullptr ? spec->indirect_root : buffer.indirect_root) !=
+		    BufferResource::NoIndirectBuffer) {
 			return refuse(TableRefusal::IndirectBuffer);
 		}
 		if (buffer.image_alias != BufferResource::NoImageAlias ||
-		    (buffer.packed_stride & ((1u << 14u) | (1u << 20u))) != 0) {
+		    (stride & ((1u << 14u) | (1u << 20u))) != 0) {
 			return refuse(TableRefusal::BufferAliased);
 		}
-		if (const auto words = words_ok(buffer.source, 4); words != TableRefusal::Eligible) {
+		// Written at addresses the host cannot bound: the write bitmap's bases are per binding.
+		if (spec != nullptr ? spec->write_tracked : buffer.write_tracked) {
+			return refuse(TableRefusal::WriteTracked);
+		}
+		if (const auto words = words_of(buffer.source, 4, plan.buffers.emplace_back());
+		    words != TableRefusal::Eligible) {
 			return refuse(words);
 		}
 	}
-	for (const auto& image: program.info.images) {
-		if (image.indirect_root != ImageResource::NoIndirectImage || image.bindless ||
-		    image.indirect_search_iterations != 0) {
+	for (size_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image = program.info.images[i];
+		const auto* spec  = specialization != nullptr && i < specialization->images.size()
+		                        ? &specialization->images[i]
+		                        : nullptr;
+		if ((spec != nullptr ? spec->indirect_root : image.indirect_root) !=
+		        ImageResource::NoIndirectImage ||
+		    (spec != nullptr ? spec->bindless : image.bindless) ||
+		    (spec != nullptr ? spec->indirect_search_iterations : image.indirect_search_iterations) !=
+		        0) {
 			return refuse(TableRefusal::IndirectDescriptor);
 		}
 		if (image.mip_mode != ImageMipMode::None) {
@@ -453,24 +633,133 @@ TableEligibilityResult TableEligibility(const ResourcePlan& program) {
 		if (image.source >= program.descriptor_sources.size()) {
 			return refuse(TableRefusal::DescriptorWords);
 		}
-		const auto count = program.descriptor_sources[image.source].dword_count;
-		if (count != 4 && count != 8) {
+		auto& descriptor = plan.images.emplace_back();
+		descriptor.count = program.descriptor_sources[image.source].dword_count;
+		if (descriptor.count != 4 && descriptor.count != 8) {
 			return refuse(TableRefusal::ImageDescriptor);
 		}
-		if (const auto words = words_ok(image.source, count); words != TableRefusal::Eligible) {
+		if (const auto words = words_of(image.source, descriptor.count, descriptor.words);
+		    words != TableRefusal::Eligible) {
 			return refuse(words);
 		}
 	}
-	for (const auto& sampler: program.info.samplers) {
-		if (sampler.bindless) {
+	for (size_t i = 0; i < program.info.samplers.size(); ++i) {
+		const auto& sampler  = program.info.samplers[i];
+		const bool  bindless = specialization != nullptr && i < specialization->samplers.size()
+		                           ? specialization->samplers[i].bindless
+		                           : sampler.bindless;
+		if (bindless) {
 			return refuse(TableRefusal::IndirectDescriptor);
 		}
-		if (const auto words = words_ok(sampler.source, 4); words != TableRefusal::Eligible) {
+		auto& descriptor = plan.samplers.emplace_back();
+		descriptor.count = 4;
+		if (const auto words = words_of(sampler.source, 4, descriptor.words);
+		    words != TableRefusal::Eligible) {
 			return refuse(words);
 		}
 	}
 	result.refusal = TableRefusal::Eligible;
+	if (out != nullptr) {
+		*out = std::move(plan);
+	}
 	return result;
+}
+
+TableEligibilityResult TableEligibility(const ResourcePlan& plan,
+                                        const ResourceSpecialization* specialization) {
+	return BuildTablePlan(plan, specialization, nullptr);
+}
+
+TableRefusal EnterTableMode(Program& program) {
+	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
+	        program.binding_layout_complete);
+	TablePlan  plan;
+	const auto result = BuildTablePlan(program, nullptr, &plan);
+	if (result.refusal != TableRefusal::Eligible) {
+		return result.refusal;
+	}
+	program.table_plan = std::move(plan);
+	program.table_mode = true;
+	return TableRefusal::Eligible;
+}
+
+void MarkTableSlots(Program& program) {
+	if (!program.table_mode) {
+		return;
+	}
+	auto& plan = program.table_plan;
+	plan.gpu.assign(plan.slots.size(), 0);
+	plan.cpu.assign(plan.slots.size(), 0);
+	const auto mark = [](std::vector<uint8_t>& set, const TablePlan::Operand& operand) {
+		if (operand.kind == TableKind::Slot && operand.value < set.size()) {
+			set[operand.value] = 1;
+		}
+	};
+	const auto slot_of = [](Value value) -> std::optional<uint32_t> {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst) {
+			return std::nullopt;
+		}
+		return inst->Arg(1).Resolve().U32();
+	};
+	const auto planning = [&](const Inst& inst) {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		return (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
+		        inst.GetOpcode() == ValueOpcode::ReadConstBuffer) &&
+		       index < program.memory_info.size() && program.memory_info[index].planning_only;
+	};
+	// The slots the shader reads (from its block): any read with a use other than the address of
+	// planning-only loads (which only tell the host's plan where the slots are).
+	for (const auto& info: program.block_info) {
+		for (const auto value: {info.condition, info.indirect_target}) {
+			if (const auto slot = value.IsEmpty() ? std::nullopt : slot_of(value);
+			    slot && *slot < plan.gpu.size()) {
+				plan.gpu[*slot] = 1;
+			}
+		}
+	}
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const auto slot = slot_of(Value(&inst));
+			if (!slot || *slot >= plan.gpu.size()) {
+				continue;
+			}
+			for (const auto& use: inst.Uses()) {
+				const auto& user = *use.user;
+				if (user.GetOpcode() != ValueOpcode::GetAddressResource ||
+				    !std::ranges::all_of(user.Uses(), [&](const Use& address) {
+					    return planning(*address.user);
+				    })) {
+					plan.gpu[*slot] = 1;
+				}
+			}
+		}
+	}
+	// The host evaluates those, the descriptor words, and the slots their addresses read.
+	for (const auto& words: plan.buffers) {
+		for (const auto& word: words) {
+			mark(plan.cpu, word);
+		}
+	}
+	for (const auto* descriptors: {&plan.images, &plan.samplers}) {
+		for (const auto& descriptor: *descriptors) {
+			for (uint32_t i = 0; i < descriptor.count; ++i) {
+				mark(plan.cpu, descriptor.words[i]);
+			}
+		}
+	}
+	for (size_t slot = 0; slot < plan.slots.size(); ++slot) {
+		plan.cpu[slot] |= plan.gpu[slot];
+	}
+	for (size_t slot = plan.slots.size(); slot-- > 0;) {
+		if (plan.cpu[slot] == 0) {
+			continue;
+		}
+		const auto& read = plan.slots[slot];
+		for (const auto* operand: {&read.low, &read.high, &read.offset, &read.records}) {
+			mark(plan.cpu, *operand);
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
