@@ -139,20 +139,23 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
-	ImageInfo        info;
-	VulkanImage      backing;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
-	mutable uint32_t query_epoch    = 0;
-	uint64_t         track_addr     = 0;
-	uint64_t         track_addr_end = 0;
-	ImageId          depth_id {};
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered     = false;
+	mutable uint32_t             query_epoch    = 0;
+	uint64_t                     track_addr     = 0;
+	uint64_t                     track_addr_end = 0;
+	ImageId                      depth_id {};
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	uint64_t              tick_accessed_last  = 0;
+	uint64_t              frame_accessed_last = 0;
+	size_t                lru_id              = 0;
+	// Native write order, compared when a one-texel alias shares this image's first element.
+	uint64_t gpu_write_seq = 0;
 
 private:
 	friend struct ImageTestAccess;

@@ -49,9 +49,18 @@ public:
 			}();
 			if (should_flush) {
 				on_flush();
+			} else {
+				LogCpuModified(manager->GetCpuAddr() + offset, bytes);
 			}
 		});
 	}
+	// Moves the ranges marked CPU-modified since the last call into `ranges`, so a caller can
+	// upload only those. Returns false when ranges were not logged (before the first call or
+	// after the log overflowed), so every tracked range must be checked.
+	[[nodiscard]] bool TakeCpuModifiedRanges(std::vector<GuestRange>& ranges);
+	// Adds a range to that log. Called after its CPU-modified bits are set, and when a new
+	// buffer starts covering memory that may already be CPU-modified.
+	void LogCpuModified(uint64_t vaddr, uint64_t size);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -105,7 +114,8 @@ public:
 	}
 
 private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t REGION_COUNT           = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t CPU_MODIFIED_LOG_LIMIT = 1024;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
@@ -151,6 +161,9 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::mutex                                     m_cpu_modified_mutex;
+	std::vector<GuestRange>                        m_cpu_modified_log;
+	bool                                           m_cpu_modified_overflow = true;
 };
 
 } // namespace Libs::Graphics

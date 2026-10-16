@@ -402,6 +402,66 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuModifiedLog() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr auto tracker_page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  std::vector<GuestRange> ranges;
+  Check(!tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "first CPU-modified log take did not request a full check");
+
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.TakeCpuModifiedRanges(ranges) && ranges.size() == 1 &&
+            ranges[0].address == address / region_size * region_size &&
+            ranges[0].size == region_size,
+        "new region was not logged as CPU modified");
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "upload logged a CPU-modified range");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  tracker.MarkRegionAsCpuModified(address + 48, 16);
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.size() == 1 &&
+            ranges[0].address == address && ranges[0].size == tracker_page,
+        "CPU-modified ranges in one page were not merged into that page");
+
+  uint32_t flushes = 0;
+  tracker.InvalidateRegion(address + page_size, 1, [&] { flushes++; });
+  Check(flushes == 0 && tracker.TakeCpuModifiedRanges(ranges) &&
+            ranges.size() == 1 && ranges[0].address == address + page_size &&
+            ranges[0].size == tracker_page,
+        "CPU invalidation was not logged as its page");
+
+  // Consecutive page faults merge, also when another stream interleaves.
+  tracker.LogCpuModified(address + tracker_page * 4, 1);
+  tracker.LogCpuModified(address + tracker_page * 64, 1);
+  tracker.LogCpuModified(address + tracker_page * 5, 1);
+  tracker.LogCpuModified(address + tracker_page * 3, 1);
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.size() == 2 &&
+            ranges[0].address == address + tracker_page * 3 &&
+            ranges[0].size == tracker_page * 3 &&
+            ranges[1].address == address + tracker_page * 64,
+        "adjacent page faults were not merged");
+
+  for (uint64_t i = 0; i < 4096; i++) {
+    tracker.LogCpuModified(address + i * 2 * tracker_page, 1);
+  }
+  Check(!tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "overflowed CPU-modified log did not request a full check");
+  Check(tracker.TakeCpuModifiedRanges(ranges) && ranges.empty(),
+        "CPU-modified logging did not resume after a full check");
+
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1130,6 +1190,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuModifiedLog();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

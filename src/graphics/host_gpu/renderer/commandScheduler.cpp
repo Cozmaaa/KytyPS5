@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -126,6 +127,9 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_gpu_profiler) {
+		GpuProfiler::Shutdown();
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -208,6 +212,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	KYTY_PROFILER_FUNCTION();
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -220,7 +225,11 @@ void CommandScheduler::PopPendingOperations() {
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
+		{
+			KYTY_PROFILER_BLOCK("Wait for priority operations");
+			WaitPriorityOperations(operation.tick);
+		}
+		KYTY_PROFILER_BLOCK("Run deferred operation");
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -334,6 +343,14 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_gpu_profiler) {
+		// Draw and dispatch zones nest inside the command buffer's zone.
+		static constexpr tracy::SourceLocationData location {"Command buffer", TracyFunction,
+		                                                     TracyFile, __LINE__, 0};
+		GpuProfiler::Initialize(m_graphics);
+		GpuProfiler::Collect(m_command.m_buffer);
+		m_gpu_zone.Begin(m_command.m_buffer, &location);
+	}
 	return m_command;
 }
 
@@ -342,6 +359,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	m_gpu_zone.End();
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

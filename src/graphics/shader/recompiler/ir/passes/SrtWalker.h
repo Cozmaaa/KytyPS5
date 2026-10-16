@@ -8,6 +8,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
+struct SrtCode;
+struct SrtNode;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
@@ -26,6 +28,13 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+// Work done by walkers on this thread, for profiling.
+struct SrtWalkCounters {
+	uint64_t evaluations  = 0; // Instructions evaluated.
+	uint64_t memory_reads = 0; // Guest words read.
+	uint64_t nested_walks = 0; // EXEC-specific walks started by ReadFirstLane.
+};
+[[nodiscard]] const SrtWalkCounters& SrtCounters();
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
@@ -43,20 +52,28 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	// Tags the constructor that takes the active mask as an SrtCode operand.
+	struct MaskOperand {};
+
+	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+	          std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
+	          uint32_t active_mask, MaskOperand);
+
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
-	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
-	bool Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
-	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	static float                            Float32(uint64_t bits);
+	bool                                    EvaluateU32(uint32_t operand, uint32_t& result);
+	bool                                    EvaluateOperand(uint32_t operand, uint64_t& result);
+	bool                                    EvaluateNode(uint32_t index, uint64_t& result);
+	bool                                    EvaluateOperation(uint32_t index, uint64_t& result);
+	bool                                    EvaluateRawRead(const SrtNode& node, uint64_t& result);
+	bool EvaluateArithmetic(const SrtNode& node, uint64_t& result);
 
 	const ResourcePlan&              m_program;
-	SrtRuntime                      m_runtime;
+	SrtCode&                         m_code;
+	SrtRuntime                       m_runtime;
 	std::span<const uint8_t>         m_clean_flat_slots;
-	SrtWalker*                      m_clean_evaluator = nullptr;
-	Value                           m_active_mask;
+	SrtWalker*                       m_clean_evaluator = nullptr;
+	uint32_t                         m_active_mask; // SrtCode operand, NoOperand without a mask.
 	ResourcePlan::EvaluationContext& m_context;
 };
 

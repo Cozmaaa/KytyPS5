@@ -39,14 +39,14 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
-	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
-	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
-	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
-	BufferCache&        GetBufferCache() { return m_buffer_cache; }
-	TextureCache&       GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	Common::Mutex&    GetMutex() { return m_mutex; }
+	CommandScheduler& GetCommandScheduler() { return m_command_scheduler; }
+	PipelineCache&    GetPipelineCache() { return m_pipeline_cache; }
+	DescriptorHeap&   GetDescriptorHeap() { return m_descriptor_heap; }
+	SamplerCache&     GetSamplerCache() { return m_sampler_cache; }
+	BufferCache&      GetBufferCache() { return m_buffer_cache; }
+	TextureCache&     GetTextureCache() { return m_texture_cache; }
+	RenderExecutor&   GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -79,9 +79,10 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
-	VideoOut::VideoOutDriver* m_video_out = nullptr;
+	VideoOut::VideoOutDriver* m_video_out             = nullptr;
 	bool                      m_fault_process_pending = false;
-	bool                      m_bda_logged = false;
+	bool                      m_bda_logged            = false;
+	std::vector<GuestRange>   m_bda_ranges;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

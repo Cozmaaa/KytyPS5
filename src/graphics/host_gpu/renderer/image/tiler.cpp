@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/profiler.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -13,7 +15,6 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -240,7 +241,7 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                   values[] {1u << element_index, direction_index};
 	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
 	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
-	const auto module =
+	const auto                       module =
 	    CompileSPV({shaders[family_index].code, shaders[family_index].words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
@@ -257,19 +258,20 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset,
-                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
-                         uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                         std::span<Dispatch> dispatches, bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
-	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
-	const uint64_t source_base              = source_offset - source_descriptor_offset;
-	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
-	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
+	const uint64_t source_descriptor_offset =
+	    Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset =
+	    Common::AlignDown(target_offset, descriptor_alignment);
+	const uint64_t source_base  = source_offset - source_descriptor_offset;
+	const uint64_t target_base  = target_offset - target_descriptor_offset;
+	const uint64_t source_range = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
@@ -343,7 +345,8 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos,
-                                        ColorTransform transform) {
+                                        ColorTransform               transform) {
+	KYTY_PROFILER_FUNCTION();
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -351,8 +354,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches, transform);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
@@ -366,8 +368,8 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, dispatches,
+	       false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
@@ -384,21 +386,23 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches, transform);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
-	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, dispatches,
+	       false);
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
-	size = Common::AlignUp(size, 4);
+	size         = Common::AlignUp(size, 4);
 	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
 			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
 		}
 		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-		        vk::BufferUsageFlagBits::eTransferDst, size);
+		                                  vk::BufferUsageFlagBits::eStorageBuffer |
+		                                      vk::BufferUsageFlagBits::eTransferSrc |
+		                                      vk::BufferUsageFlagBits::eTransferDst,
+		                                  size);
 	}
 	return {buffer->Handle(), 0, size};
 }
@@ -451,7 +455,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			code  = GPU_TILER_DEMOTE_D16_SPV;
 			words = std::size(GPU_TILER_DEMOTE_D16_SPV);
 		}
-		const auto module = CompileSPV({code, words}, m_graphics.device);
+		const auto                        module = CompileSPV({code, words}, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage               = vk::ShaderStageFlagBits::eCompute;
 		stage.module              = module;
@@ -592,8 +596,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 		default: EXIT("invalid color transform\n");
 	}
 	EXIT_IF(input.size == 0 || input.size % element_bytes != 0 ||
-	        input.size / element_bytes > UINT32_MAX ||
-	        output.size < input.size);
+	        input.size / element_bytes > UINT32_MAX || output.size < input.size);
 	const auto pixels = static_cast<uint32_t>(input.size / element_bytes);
 	if (m_color_transform == nullptr) {
 		const auto module = CompileSPV(GPU_TILER_COLOR_TRANSFORM_SPV, m_graphics.device);
@@ -602,10 +605,10 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 		stage.module = module;
 		stage.pName  = "main";
 		vk::ComputePipelineCreateInfo create {};
-		create.stage  = stage;
-		create.layout = m_pipeline_layout;
-		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_color_transform);
+		create.stage      = stage;
+		create.layout     = m_pipeline_layout;
+		const auto result = m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr,
+		                                                             &m_color_transform);
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create color transform pipeline");
 	}

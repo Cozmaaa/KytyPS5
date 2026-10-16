@@ -2,6 +2,30 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Debug UFC5 from startup",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\_Build\\windows\\install\\kyty_emulator.exe",
+            "args": [
+                "--game", "E:/EA SPORTS UFC 5 01.031 PPSA03541 [DLPSGAME.COM]",
+                "--printf-direction", "Silent",
+                "--shader-log-direction", "Silent",
+                "--vulkan-validation", "false",
+                "--gpu-assisted-validation", "false",
+                "--shader-validation", "false",
+                "--graphics-debug-dump", "false",
+                "--command-buffer-dump", "false",
+                "--amd-cpu"
+            ],
+            "cwd": "${workspaceFolder}\\_Build\\ufc5\\runtime",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "logging": {
+                "exceptions": false,
+                "moduleLoad": false
+            }
+        },
+        {
             "name": "Debug launcher UI",
             "type": "cppvsdbg",
             "request": "launch",

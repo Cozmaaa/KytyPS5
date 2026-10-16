@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -17,6 +18,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_command_scheduler.EnableGpuProfiler();
 }
 
 RenderContext::~RenderContext() {
@@ -90,6 +92,9 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	// PrepareBda skipped CPU writes to buffers here while the range was unmapped. Log it after
+	// adding it, so the PrepareBda that takes the entry also sees the mapping.
+	m_buffer_cache.LogCpuModified(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -101,10 +106,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		if (m_command_scheduler.Active() && (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		                                     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		                                     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -128,10 +132,23 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+	// Shaders can reach any mapped buffer, but only buffers the CPU modified since the last
+	// call need an upload. The zone value is the number of modified ranges.
+	KYTY_PROFILER_NAMED_FUNCTION(bda_zone);
+	const bool logged      = m_buffer_cache.TakeCpuModifiedRanges(m_bda_ranges);
+	const auto synchronize = [this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	};
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (!logged) {
+		KYTY_PROFILER_BLOCK("Synchronize all buffers");
+		m_mapped_ranges.ForEach(synchronize);
+	} else {
+		bda_zone.Value(m_bda_ranges.size());
+		for (const auto& range: m_bda_ranges) {
+			m_mapped_ranges.ForEachInRange(range.address, range.size, synchronize);
+		}
+	}
 	m_fault_process_pending = true;
 }
 

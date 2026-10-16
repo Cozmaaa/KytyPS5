@@ -39,7 +39,7 @@ bool GraphicContext::CreateAllocator() {
 	info.device           = device;
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
-	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	info.flags            = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
@@ -49,6 +49,7 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	m_release_thread = std::jthread([this](std::stop_token stop) { ReleaseThread(stop); });
 	return true;
 }
 
@@ -56,8 +57,70 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	if (m_release_thread.joinable()) {
+		m_release_thread.request_stop();
+		m_release_thread.join();
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+}
+
+void GraphicContext::ReleaseBuffer(VkBuffer buffer, VmaAllocation allocation) {
+	QueueRelease({.buffer = buffer, .allocation = allocation});
+}
+
+void GraphicContext::QueueRelease(const Release& release) {
+	EXIT_IF(allocator == nullptr);
+	{
+		std::lock_guard lock(m_release_mutex);
+		if (m_release_thread.joinable() && !m_release_thread.get_stop_token().stop_requested()) {
+			m_releases.push_back(release);
+			m_release_changed.notify_all();
+			return;
+		}
+	}
+	if (release.buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(allocator, release.buffer, release.allocation);
+	} else {
+		vmaDestroyImage(allocator, release.image, release.allocation);
+	}
+}
+
+void GraphicContext::FinishReleases() {
+	KYTY_PROFILER_FUNCTION();
+	std::unique_lock lock(m_release_mutex);
+	m_release_changed.wait(lock, [this] { return m_releases.empty() && !m_releasing; });
+}
+
+void GraphicContext::ReleaseThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("Thread_GpuRelease");
+	std::vector<Release> batch;
+	std::unique_lock     lock(m_release_mutex);
+	for (;;) {
+		m_release_changed.wait(lock, stop, [this] { return !m_releases.empty(); });
+		if (m_releases.empty()) {
+			// Stopping; every queued release has been freed.
+			return;
+		}
+		batch.swap(m_releases);
+		m_releasing = true;
+		lock.unlock();
+		{
+			KYTY_PROFILER_NAMED_BLOCK(release_zone, "Release memory");
+			release_zone.Value(batch.size());
+			for (const auto& release: batch) {
+				if (release.buffer != VK_NULL_HANDLE) {
+					vmaDestroyBuffer(allocator, release.buffer, release.allocation);
+				} else {
+					vmaDestroyImage(allocator, release.image, release.allocation);
+				}
+			}
+		}
+		batch.clear();
+		lock.lock();
+		m_releasing = false;
+		m_release_changed.notify_all();
+	}
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -135,11 +198,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
+	const auto create = [&] {
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+		image.image                   = native_image;
+		return result;
+	};
+	auto result = create();
+	if (result != vk::Result::eSuccess) {
+		// The memory may still be queued on the release thread.
+		FinishReleases();
+		result = create();
+	}
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
@@ -163,7 +235,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	QueueRelease({.image = image.image, .allocation = image.allocation});
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }

@@ -6,8 +6,10 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <condition_variable>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -31,19 +33,21 @@ struct GraphicContext {
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
-	bool                               attachment_feedback_loop_enabled      = false;
-	bool                               provoking_vertex_last_enabled         = false;
-	bool                               supports_block_texel_view              = false;
-	bool                                      mesh_shader_enabled                   = false;
-	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
-	uint32_t                           subgroup_size                         = 0;
-	uint32_t                           min_subgroup_size                     = 0;
-	uint32_t                           max_subgroup_size                     = 0;
-	uint32_t                           max_push_descriptors                  = 0;
-	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
-	Common::Mutex                      queue_mutex;
-	uint32_t                           queue_family = static_cast<uint32_t>(-1);
-	vk::Queue                          queue        = nullptr;
+	bool attachment_feedback_loop_enabled = false;
+	bool provoking_vertex_last_enabled    = false;
+	bool supports_block_texel_view        = false;
+	// Indirect draws with a nonzero first instance can read their arguments on the GPU.
+	bool                                      draw_indirect_first_instance_enabled = false;
+	bool                                      mesh_shader_enabled                  = false;
+	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties               = {};
+	uint32_t                                  subgroup_size                        = 0;
+	uint32_t                                  min_subgroup_size                    = 0;
+	uint32_t                                  max_subgroup_size                    = 0;
+	uint32_t                                  max_push_descriptors                 = 0;
+	vk::ShaderStageFlags                      required_subgroup_size_stages        = {};
+	Common::Mutex                             queue_mutex;
+	uint32_t                                  queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                                 queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -100,11 +104,32 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Frees a buffer the GPU no longer uses on the release thread: freeing a dedicated
+	// allocation takes over 100 us, which the command processor thread cannot afford.
+	void ReleaseBuffer(VkBuffer buffer, VmaAllocation allocation);
+	// Waits for queued releases, so an allocation that failed can retry with their memory.
+	void FinishReleases();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	struct Release {
+		VkBuffer      buffer     = VK_NULL_HANDLE;
+		VkImage       image      = VK_NULL_HANDLE;
+		VmaAllocation allocation = nullptr;
+	};
+
+	void QueueRelease(const Release& release);
+	void ReleaseThread(std::stop_token stop);
+
+	std::mutex                  m_release_mutex;
+	std::condition_variable_any m_release_changed;
+	std::vector<Release>        m_releases;
+	bool                        m_releasing = false;
+	// Declared last, so the thread is joined before the state it uses is destroyed.
+	std::jthread m_release_thread;
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -124,21 +149,19 @@ struct VulkanImage {
 	VulkanImage() = default;
 	KYTY_CLASS_NO_COPY(VulkanImage);
 
-	vk::Format                    format      = vk::Format::eUndefined;
-	vk::ImageType                 image_type  = vk::ImageType::e2D;
-	vk::Extent3D                  extent      = {1, 1, 1};
-	uint32_t                      layers      = 1;
-	uint32_t                      mip_levels  = 1;
-	uint32_t                      samples     = 1;
-	vk::ImageUsageFlags           usage       = {};
-	vk::ImageCreateFlags          flags       = {};
-	vk::Image                     image       = nullptr;
+	vk::Format                    format     = vk::Format::eUndefined;
+	vk::ImageType                 image_type = vk::ImageType::e2D;
+	vk::Extent3D                  extent     = {1, 1, 1};
+	uint32_t                      layers     = 1;
+	uint32_t                      mip_levels = 1;
+	uint32_t                      samples    = 1;
+	vk::ImageUsageFlags           usage      = {};
+	vk::ImageCreateFlags          flags      = {};
+	vk::Image                     image      = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	VmaAllocation                allocation = nullptr;
+	VmaAllocation                 allocation = nullptr;
 };
-
-
 
 } // namespace Libs::Graphics
 

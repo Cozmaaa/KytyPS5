@@ -122,7 +122,8 @@ public:
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
-	// Runtime indices belong to the resource plan that owns this instruction.
+	// Index of the instruction's node in the SrtCode of the resource plan that owns it, taken
+	// from `count` on first use.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
 		if (evaluation_index == UINT32_MAX) {
 			evaluation_index = count++;
@@ -159,22 +160,135 @@ private:
 	void ClearArgs();
 
 	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
+	static constexpr uint8_t PhiArity    = UINT8_MAX;
 
-	ValueOpcode         opcode;
-	uint8_t             num_args;
-	bool                live = false;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
-	uint64_t            flags;
-	Block*              parent = nullptr;
+	ValueOpcode      opcode;
+	uint8_t          num_args;
+	bool             live             = false;
+	mutable uint32_t evaluation_index = UINT32_MAX;
+	uint64_t         flags;
+	Block*           parent = nullptr;
 	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
+		std::array<Value, InlineArity>        fixed_args {};
+		std::vector<Value>                    large_args;
 		std::vector<std::pair<Block*, Value>> phi_args;
 	};
-	std::vector<Use>    uses;
+	std::vector<Use> uses;
 };
 
 static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
+
+// The accessors below run for every node the resource walker visits on each draw, so they
+// are defined here to be inlined.
+
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Type Value::GetType() const {
+	if (IsPhi()) {
+		return inst->Flags<Type>();
+	}
+	if (IsIdentity()) {
+		return inst->Arg(0).GetType();
+	}
+	return type == Type::Opaque ? inst->GetType() : type;
+}
+
+inline Inst* Value::Instruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return inst;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
+
+inline bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+inline uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+inline uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+inline float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
+inline bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

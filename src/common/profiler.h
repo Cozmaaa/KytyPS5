@@ -49,11 +49,22 @@ struct Lifecycle {
 	    kyty_profiler_source_location_, line) {name, TracyFunction, TracyFile,                     \
 	                                           static_cast<uint32_t>(line),                        \
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
-	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
+	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                            \
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line), TRACY_CALLSTACK,              \
+	    tracy::ProfilerAvailable())
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
+
+// Like KYTY_PROFILER_BLOCK, but the zone is declared as `zone`, so a value can be attached
+// with zone.Value().
+#define KYTY_PROFILER_NAMED_BLOCK(zone, name)                                                      \
+	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
+	    kyty_profiler_source_location_, __LINE__) {name, TracyFunction, TracyFile,                 \
+	                                               static_cast<uint32_t>(__LINE__), 0};            \
+	tracy::ScopedZone zone(&KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, __LINE__),        \
+	                       TRACY_CALLSTACK, tracy::ProfilerAvailable())
+
+#define KYTY_PROFILER_NAMED_FUNCTION(zone) KYTY_PROFILER_NAMED_BLOCK(zone, nullptr)
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
 

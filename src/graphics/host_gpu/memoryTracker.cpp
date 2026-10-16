@@ -63,7 +63,45 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// A new region starts with every page CPU-modified.
+	LogCpuModified(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	return ptr;
+}
+
+void MemoryTracker::LogCpuModified(uint64_t vaddr, uint64_t size) {
+	// Dirty state is per page, and page-aligned ranges let consecutive page faults merge.
+	const auto      begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto      end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	std::lock_guard lock(m_cpu_modified_mutex);
+	if (m_cpu_modified_overflow) {
+		return;
+	}
+	// Threads writing different streams interleave, so check a few recent ranges.
+	constexpr size_t MergeWindow = 8;
+	const auto       recent      = std::min(m_cpu_modified_log.size(), MergeWindow);
+	for (auto it = m_cpu_modified_log.end() - recent; it != m_cpu_modified_log.end(); ++it) {
+		const auto last_end = it->address + it->size;
+		if (begin <= last_end && end >= it->address) {
+			it->address = std::min(it->address, begin);
+			it->size    = std::max(last_end, end) - it->address;
+			return;
+		}
+	}
+	if (m_cpu_modified_log.size() == CPU_MODIFIED_LOG_LIMIT) {
+		m_cpu_modified_log.clear();
+		m_cpu_modified_overflow = true;
+		return;
+	}
+	m_cpu_modified_log.push_back({begin, end - begin});
+}
+
+bool MemoryTracker::TakeCpuModifiedRanges(std::vector<GuestRange>& ranges) {
+	ranges.clear();
+	std::lock_guard lock(m_cpu_modified_mutex);
+	std::swap(ranges, m_cpu_modified_log);
+	// Logging runs in page-fault handlers, so it should not allocate.
+	m_cpu_modified_log.reserve(CPU_MODIFIED_LOG_LIMIT);
+	return !std::exchange(m_cpu_modified_overflow, false);
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -88,6 +126,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	LogCpuModified(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -128,6 +167,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	LogCpuModified(vaddr, size);
 }
 
 } // namespace Libs::Graphics
