@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -897,11 +898,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 // the render pass and one barrier pair around all the copies, not one of each per buffer (~75
 // uploads a walk, ~5 walks a frame in UFC 5 fights). KYTY_SYNC_BATCH=0: one at a time, as before.
 void BufferCache::BeginSyncBatch() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_SYNC_BATCH");
+	static const Common::AbSwitch<bool> enabled("KYTY_SYNC_BATCH", [](const char* value) {
 		return value == nullptr || value[0] != '0';
-	}();
-	m_sync_batching  = enabled;
+	});
+	m_sync_batching  = enabled.Get();
 	m_sync_batch_tick = m_scheduler.CurrentTick();
 }
 
@@ -1410,27 +1410,34 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 // here first. Nothing else changes: an earlier version gave guest memory the filled bytes and
 // dropped them from the GPU-written ranges, and the UFC 5 main menu then faulted the GPU on a
 // null pointer, since later GPU writes to reused memory are not all marked GPU-written.
-// KYTY_KNOWN_FILLS=0 records none, so every such read downloads as before.
+// KYTY_KNOWN_FILLS=0 records none, so every such read downloads as before. Per A/B arm
+// (common/abSwitch.h): off still forgets the fills a new fill overwrites, so the table is right
+// when the other arm reads it again.
 static bool KnownFillsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_KNOWN_FILLS");
-		const bool  on    = value == nullptr || value[0] != '0';
-		LOGF("BufferCache: known fills %s (KYTY_KNOWN_FILLS)\n", on ? "on" : "off");
-		return on;
+	static const Common::AbSwitch<bool> enabled("KYTY_KNOWN_FILLS", [](const char* value) {
+		return value == nullptr || value[0] != '0';
+	});
+	static const bool logged = [] {
+		LOGF("BufferCache: known fills %s (KYTY_KNOWN_FILLS)\n", enabled.Get(0) ? "on" : "off");
+		return true;
 	}();
-	return enabled;
+	(void)logged;
+	return enabled.Get();
 }
 
 void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
-	if (!KnownFillsEnabled() || size == 0) {
+	if (size == 0) {
 		return;
 	}
 	std::unique_lock lock(m_dirty_ranges_mutex);
+	EraseKnownFillsLocked(vaddr, size);
+	if (!KnownFillsEnabled()) {
+		return;
+	}
 	// Transient allocations move around; the table is a cache of recent fills, not a history.
 	if (m_known_fills.size() >= 8192) {
 		m_known_fills.clear();
 	}
-	EraseKnownFillsLocked(vaddr, size);
 	m_known_fills.emplace(vaddr, std::pair {vaddr + size, value});
 }
 
@@ -1482,6 +1489,9 @@ void BufferCache::EraseKnownFillsLocked(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) {
+	if (!KnownFillsEnabled()) {
+		return false;
+	}
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	if (m_known_fills.empty() || size == 0) {
 		return false;
@@ -1763,11 +1773,10 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	// holds any dirty page was ~2,450 buffer syncs a walk for ~75 uploads in UFC 5 fights, ~1.6 ms
 	// a walk and ~5 walks a frame (RenderContext::PrepareBda). The same buffers upload either way.
 	// KYTY_BDA_WALK_RUNS=0: every buffer of each maybe-dirty region, as before.
-	static const bool runs = [] {
-		const char* value = std::getenv("KYTY_BDA_WALK_RUNS");
+	static const Common::AbSwitch<bool> runs("KYTY_BDA_WALK_RUNS", [](const char* value) {
 		return value == nullptr || value[0] != '0';
-	}();
-	if (runs) {
+	});
+	if (runs.Get()) {
 		// The runs come in address order and buffers do not overlap: each buffer over one or more
 		// runs is synchronized once, from its first dirty byte to its last (one upload, as the
 		// region walk made it; a sync per run made a buffer with several runs upload several times).
