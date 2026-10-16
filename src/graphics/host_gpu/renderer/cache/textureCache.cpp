@@ -262,8 +262,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// Color clear checks of GPU-written metadata run on the GPU (KYTY_GPU_CLEAR_CHECK=0: on the CPU,
 	// draining the GPU). UFC 5 fight route, 2026-10-15, known fills on: the CPU check drained ~1.2
 	// times a frame (~7.5 ms each, a CMask a compute pass rewrites); on the GPU, DrawAuto 155 -> 8.5
-	// us a call, screenshots the same, and by scene (the CPU fight is either on the mat, few draws,
-	// or standing with the crowd in view) ground ~37 fps against 33, standing ~28 against ~25.
+	// us a call, screenshots the same. In-run A/B (common/abSwitch.h), 2026-10-16, standing fight:
+	// off is 17.8 % slower (+-0.7 %), 24.0 against 29.2 fps, 13.9 against 9.9 us a draw.
 	if (ClearCheckSwitch().Get(0) || ClearCheckSwitch().Get(1)) {
 		if (m_graphics.conditional_rendering_enabled) {
 			m_clear_check = std::make_unique<ColorClearCheck>(graphics, scheduler);
