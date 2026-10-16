@@ -1410,12 +1410,14 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 // here first. Nothing else changes: an earlier version gave guest memory the filled bytes and
 // dropped them from the GPU-written ranges, and the UFC 5 main menu then faulted the GPU on a
 // null pointer, since later GPU writes to reused memory are not all marked GPU-written.
-// KYTY_KNOWN_FILLS=0 records none, so every such read downloads as before. Per A/B arm
-// (common/abSwitch.h): off still forgets the fills a new fill overwrites, so the table is right
+// Off by default since the GPU clear check (KYTY_GPU_CLEAR_CHECK) answers those reads without a
+// drain: in-run A/B, 2026-10-16, standing fight, off was +2.7 % (+-0.9) and +3.7 % (+-1.9) faster,
+// 9.8 -> 9.4 and 10.1 -> 9.6 us a draw, rendering the same. KYTY_KNOWN_FILLS=1 records them. Per A/B
+// arm (common/abSwitch.h): off still forgets the fills a new fill overwrites, so the table is right
 // when the other arm reads it again.
 static bool KnownFillsEnabled() {
 	static const Common::AbSwitch<bool> enabled("KYTY_KNOWN_FILLS", [](const char* value) {
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] != '0';
 	});
 	static const bool logged = [] {
 		LOGF("BufferCache: known fills %s (KYTY_KNOWN_FILLS)\n", enabled.Get(0) ? "on" : "off");
