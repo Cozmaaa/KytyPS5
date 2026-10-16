@@ -891,6 +891,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     static_cast<uint32_t>(tile));
 		}
 	}
+	// A host image has at most floor(log2(largest extent)) + 1 levels; guest descriptors can name
+	// one more (UFC 5: 11 levels of a 512x512 texture, VUID-VkImageCreateInfo-mipLevels-00958).
+	// Such an image was created with them anyway, and a mip-chain compute shader
+	// (056cd586eca8fb63) storing to the extra level wrote past the image's memory: device lost
+	// (WriteInvalid) while a fight loads. The extra levels are 1x1 like the last valid one, so
+	// they alias it. (The guest layout above keeps the physical levels.)
+	const auto valid_levels =
+	    static_cast<uint32_t>(std::bit_width(std::max({width, height, volume ? depth : 1u})));
+	if (!multisampled && levels > valid_levels) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 8) {
+			LOGF("Texture levels clamped: %u -> %u for %ux%u (base %u, last %u, storage %d)\n", levels,
+			     valid_levels, width, height, base_level, last_level, storage ? 1 : 0);
+		}
+		levels    = valid_levels;
+		view_base = std::min(view_base, valid_levels - 1u);
+	}
 	uint32_t      pitch = 0;
 	TileSizeAlign size {};
 	if (multisampled) {
@@ -959,6 +976,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
+	// (Within the levels the image has: see valid_levels above.)
+	desc.view_info.level_count =
+	    std::min(desc.view_info.level_count, desc.info.resources.levels - view_base);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	if (use_cache) {
@@ -1045,9 +1065,12 @@ static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBuffe
 	                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
 	                         nullptr);
 	for (const auto& fill: fills) {
+		// The returned offset, not buffer->Offset(address): a CPU-dirty word comes back as a copy in
+		// the stream buffer (ObtainBuffer's small-range path), where Offset(address) is meaningless.
+		// That copied the wrong word whenever the page was CPU-dirty: skinned fighters lost limbs,
+		// hair and shorts patterns in UFC 5 once BDA walks (which make most pages clean) ran less.
 		auto [buffer, offset] = cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
-		(void)offset;
-		const vk::BufferCopy copy {buffer->Offset(fill.address),
+		const vk::BufferCopy copy {offset,
 		                           flat.offset + uint64_t {fill.flat_offset} * sizeof(uint32_t),
 		                           sizeof(uint32_t)};
 		recorder.copyBuffer(buffer->Handle(), flat.buffer, 1, &copy);
@@ -2239,6 +2262,20 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 // The stages' BDA loads see the CPU's writes: only the ranges their read plans name when every
 // stage that uses BDA has one that evaluates (IR::BdaReadPlan), every CPU-dirty buffer otherwise.
 void RenderExecutor::PrepareBdaBindings(std::span<PreparedBindings* const> stages) {
+	// Diagnostics: KYTY_BDA_PLAN_ONLY=<hex hash>,...: only those programs' read plans are used (a
+	// bisection of which plan misses a read).
+	static const std::vector<uint64_t> plan_only = [] {
+		std::vector<uint64_t> hashes;
+		if (const char* value = std::getenv("KYTY_BDA_PLAN_ONLY"); value != nullptr) {
+			for (const char* at = value; *at != '\0';) {
+				char* end = nullptr;
+				hashes.push_back(std::strtoull(at, &end, 16));
+				at = (end != nullptr && *end == ',') ? end + 1 : (end != nullptr ? end : at + 1);
+				if (end == nullptr || *end == '\0') break;
+			}
+		}
+		return hashes;
+	}();
 	bool bounded  = true;
 	bool uses_dma = false;
 	m_bda_ranges.clear();
@@ -2249,6 +2286,9 @@ void RenderExecutor::PrepareBdaBindings(std::span<PreparedBindings* const> stage
 		}
 		uses_dma = true;
 		m_bda_stage_ranges.clear();
+		if (!plan_only.empty() && std::ranges::find(plan_only, program.shader_hash) == plan_only.end()) {
+			bounded = false;
+		}
 		if (bounded && stage->runtime->resources != nullptr &&
 		    ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, *stage->runtime->resources,
 		                                              m_bda_stage_ranges)) {

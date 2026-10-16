@@ -959,6 +959,19 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
+		if (program.info.uses_dma) {
+			// The BDA programs and their read plans (BdaReadPlan), once per permutation.
+			std::string spans;
+			for (const auto& span: program.bda_read_plan.spans) {
+				spans += fmt::format(" {}{}:{}+[{},{})", span.scalar_base ? "s" : "",
+				                     span.low.kind == ShaderRecompiler::IR::BdaReadWord::Kind::Flat       ? "flat"
+				                     : span.low.kind == ShaderRecompiler::IR::BdaReadWord::Kind::UserData ? "ud"
+				                                                                                         : "imm",
+				                     span.low.value, span.begin, span.end);
+			}
+			LOGF("BDA plan: %s 0x%016" PRIx64 " complete=%d%s\n", stage_name, options.shader_hash,
+			     program.bda_read_plan.complete ? 1 : 0, spans.c_str());
+		}
 		if (ShaderRecompiler::IR::TableCensusEnabled()) {
 			const auto census     = ShaderRecompiler::IR::TableEligibility(source.resource_plan);
 			program.table_refusal = static_cast<uint8_t>(census.refusal);

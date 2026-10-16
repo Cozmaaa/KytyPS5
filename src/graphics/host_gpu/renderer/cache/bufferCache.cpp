@@ -1023,6 +1023,17 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSynced(uint64_t vaddr, uint64_t size) {
+	if (m_scheduler.Current().IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {

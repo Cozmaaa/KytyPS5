@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <string>
 #include <limits>
 #include <memory>
@@ -598,6 +599,37 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+
+	// Diagnostics: KYTY_LOG_CS_ADDR=<hex guest code address>: the first 64 dispatches of that
+	// compute shader with what they read and write (a device-lost hunt: a store to an invalid GPU
+	// address in such a dispatch while UFC 5 loads a fight).
+	{
+		static const uint64_t watched = [] {
+			const char* value = std::getenv("KYTY_LOG_CS_ADDR");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+		}();
+		static uint32_t logged = 0;
+		if (watched != 0 && sh_ctx.GetCs().cs_regs.data_addr == watched && logged < 64) {
+			logged++;
+			std::string line = fmt::format(
+			    "WatchCS: hash={:016x} groups={}x{}x{} uses_dma={} address_writes={} buffers={} images={}",
+			    program.shader_hash, thread_group_x, thread_group_y, thread_group_z,
+			    program.info.uses_dma ? 1 : 0, program.has_address_writes ? 1 : 0,
+			    program.info.buffers.size(), program.info.images.size());
+			for (size_t i = 0; i < bindings.buffer_sources.size(); i++) {
+				const auto& source  = bindings.buffer_sources[i];
+				const bool  written = i < program.info.buffers.size() && program.info.buffers[i].written;
+				line += fmt::format(" b{}{}:{:x}+{:x}", i, written ? "w" : "", source.address, source.size);
+			}
+			for (size_t i = 0; i < program.info.images.size(); i++) {
+				const auto& image = program.info.images[i];
+				if (image.written || image.atomic) {
+					line += fmt::format(" i{}w", i);
+				}
+			}
+			LOGF("%s\n", line.c_str());
+		}
+	}
 
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(

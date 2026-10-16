@@ -81,6 +81,10 @@ public:
 	                                                        bool     is_texel_buffer      = false,
 	                                                        BufferId id                   = {},
 	                                                        bool     needs_device_address = false);
+	// The cached buffer over the range, registered and synchronized, never the stream buffer copy
+	// ObtainBuffer may return for a small CPU-written read: for callers that then use the cached
+	// buffer itself (FindBuffer, its device address, its Offset).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferSynced(uint64_t vaddr, uint64_t size);
 	// A written binding of which the shader's stores reach only [written_vaddr, written_vaddr +
 	// written_size): the whole range is synchronized, only that part becomes GPU-written.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferWritten(uint64_t vaddr, uint64_t size,

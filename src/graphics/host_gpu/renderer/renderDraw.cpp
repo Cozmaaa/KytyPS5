@@ -1393,17 +1393,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (emit.gpu_args_address != 0) {
 		// The mesh shader reads the start vertex there, and the counts are copied from there:
 		// synchronize and register the arguments like the guest indices below.
-		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_args_address, 16u, false, false,
-		                                              {}, true);
+		// (The cached buffer itself: the copies below read it through FindBuffer.)
+		(void)m_context.GetBufferCache().ObtainBufferSynced(emit.gpu_args_address, 16u);
 	}
 	if (emit.gpu_instance_count_address != 0) {
-		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_instance_count_address, 4u, false,
-		                                              false, {}, true);
+		(void)m_context.GetBufferCache().ObtainBufferSynced(emit.gpu_instance_count_address, 4u);
 	}
 	if (mesh_active && draw.IsIndexed()) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
+		// Register and synchronize the original guest indices for shader reads (by device
+		// address). PrepareGraphicsBindings's BDA walk used to synchronize them; a draw whose BDA
+		// preparation is bounded by read plans (KYTY_BDA_READ_PLAN) does not walk.
+		(void)m_context.GetBufferCache().ObtainBufferSynced(
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
