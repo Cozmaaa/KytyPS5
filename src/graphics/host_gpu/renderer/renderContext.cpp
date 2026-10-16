@@ -320,6 +320,25 @@ bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
 	for (const auto& range: ranges) {
 		m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(range.address, range.size);
 	}
+	// KYTY_BDA_READ_PLAN_FRAME_WALK=1 (default with the plans): the full walk still runs once per
+	// game frame, for what the plans miss (UFC 5's fighter shorts lose their gold pattern without
+	// it: some BDA read is outside every plan's ranges).
+	static const bool frame_walk = [] {
+		const char* value = std::getenv("KYTY_BDA_READ_PLAN_FRAME_WALK");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (frame_walk && m_gpu != nullptr) {
+		const auto frame = static_cast<uint64_t>(m_gpu->GetFrameNum());
+		const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+		if (frame != m_bda_plan_walk_frame && epoch != m_bda_synced_epoch) {
+			m_bda_plan_walk_frame = frame;
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
+			});
+			m_bda_synced_epoch = epoch;
+		}
+	}
 	m_fault_process_pending = true;
 	return true;
 }

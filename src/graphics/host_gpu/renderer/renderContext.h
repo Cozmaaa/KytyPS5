@@ -102,6 +102,7 @@ private:
 	uint64_t                  m_bda_walk_enqueued     = 0; // g_guest_enqueued_seq when the last walk started
 	uint64_t                  m_bda_walk_gpu_dirty    = 0; // g_gpu_thread_dirty_seq then
 	uint64_t                  m_bda_walk_wait         = 0; // g_gpu_wait_seq then
+	uint64_t                  m_bda_plan_walk_frame   = UINT64_MAX; // read plans: the frame of the last full walk
 	uint64_t                  m_bda_walk_newer        = 0; // diagnostics: walks for a newer submission
 	uint64_t                  m_bda_walk_gpu_made     = 0; //   and for GPU-thread writes
 	uint64_t                  m_bda_walk_gpu_only     = 0; //   GPU-thread ranges synced without a walk

@@ -3,7 +3,8 @@
 // From the Demon's Souls fork (github.com/chenxiao07/KytyPS5, fba4c3d7). Changed for this tree: a
 // ReadConst slot is an index into srt_reads, whose flat_offset is its place in the flattened SRT
 // (the fork used the slot itself, which here named another word: stale BDA reads, a black referee
-// head in UFC 5), and a slot the GPU fills does not evaluate.
+// head in UFC 5), a slot the GPU fills does not evaluate, and indirect buffers (descriptors the
+// shader loads from memory) and BVH or trap instructions leave the plan incomplete.
 
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -138,8 +139,15 @@ std::optional<BdaReadWord> ReadWord(const Program& program, Value value) {
 BdaReadPlan BuildBdaReadPlan(const Program& program) {
 	BdaReadPlan result;
 	if (!program.info.uses_dma) return result;
+	// This tree's other BDA reads: buffers whose descriptors the shader loads from guest memory
+	// (ResourceKind::IndirectBuffer) read wherever those point; no plan covers them.
+	if (std::ranges::any_of(program.memory_info,
+	                        [](const MemoryInfo& memory) { return memory.kind == ResourceKind::IndirectBuffer; }))
+		return {};
 	for (const auto* block: program.blocks)
 		for (const auto& inst: block->Instructions()) {
+			if (inst.GetOpcode() == ValueOpcode::BvhIntersect || inst.GetOpcode() == ValueOpcode::ShaderTrap)
+				return {};
 			const auto address = AddressOpcodeInfoOf(inst.GetOpcode());
 			if (address.access == AddressAccess::None) continue;
 			const auto index = inst.Flags<MemoryFlags>().index;
