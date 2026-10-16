@@ -553,6 +553,8 @@ endfunction()
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 # Offline batch translation of shaders extracted from game files; a tool, not a test.
 add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
+# Offline replay of the shader disk cache's recorded permutations; a tool, not a test.
+add_kyty_full_emulator_test(shader_cache_replay_tool "${KYTY_TESTS_DIR}/ShaderCacheReplayTool.cpp")
 if(KYTY_CLANG_CL)
 	# Symbols for the stack it prints when a shader crashes it.
 	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"

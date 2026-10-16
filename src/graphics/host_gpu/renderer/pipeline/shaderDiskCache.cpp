@@ -836,6 +836,37 @@ void AppendSpecialization(ByteWriter& key, const IR::ResourceSpecialization& val
 	writer(value);
 }
 
+bool ReadSpecialization(ByteReader& key, IR::ResourceSpecialization& value) {
+	Reader reader {.in = key};
+	reader(value);
+	return key.Ok();
+}
+
+bool ReadEntryFile(const std::filesystem::path& path, std::vector<uint8_t>& key,
+                   std::vector<uint8_t>& payload) {
+	std::vector<uint8_t> file;
+	if (!ReadFile(path, file)) {
+		return false;
+	}
+	ByteReader reader(file);
+	uint32_t   magic        = 0;
+	uint32_t   format       = 0;
+	uint64_t   key_size     = 0;
+	uint64_t   payload_size = 0;
+	uint64_t   payload_hash = 0;
+	constexpr size_t header = sizeof(magic) + sizeof(format) + 3 * sizeof(uint64_t);
+	if (!reader.Get(magic) || !reader.Get(format) || !reader.Get(key_size) ||
+	    !reader.Get(payload_size) || !reader.Get(payload_hash) || magic != FileMagic ||
+	    format != FormatVersion || key_size > file.size() - header ||
+	    payload_size != file.size() - header - key_size ||
+	    XXH3_64bits(file.data() + header + key_size, payload_size) != payload_hash) {
+		return false;
+	}
+	key.assign(file.begin() + header, file.begin() + static_cast<std::ptrdiff_t>(header + key_size));
+	payload.assign(file.begin() + static_cast<std::ptrdiff_t>(header + key_size), file.end());
+	return true;
+}
+
 bool EncodeSourceRecord(bool unsupported, bool uses_clock, const IR::ResourcePlan* plan,
                         std::vector<uint8_t>& out) {
 	ByteWriter writer;
