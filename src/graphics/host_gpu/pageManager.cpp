@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/virtualMemory.h"
@@ -266,10 +267,25 @@ struct PageManager::Impl {
 		std::printf("%s\n", line.c_str());
 	}
 
+	// A protection change covers a run of pages whose protection changes, extended over pages
+	// between them that already have it, up to KYTY_PROTECT_GAP of those in a row (default 16; per
+	// A/B arm, common/abSwitch.h; 0: never extended). Windows charges ~3.5 us a call and ~49 ns a
+	// page (UFC 5 fight, GPU thread: exact runs 52k calls / 215k pages a second, 190 ms; runs over
+	// any gap in a 4 MB region, as before, 10.5k calls / 1.6M pages, 115 ms), so a gap is worth
+	// bridging below ~70 pages. In-run A/B against no limit, 2026-10-16: 16 pages +2.8 % (+-0.7),
+	// 64 pages +2.6 % (+-1.3); exact -2.3 % (+-1.4).
+	static uint64_t ProtectGapBytes() {
+		static const Common::AbSwitch<uint64_t> gap("KYTY_PROTECT_GAP", [](const char* value) {
+			return (value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull) * PAGE_SIZE;
+		});
+		return gap.Get();
+	}
+
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
 		SpinGuard lock(region.lock);
+		const auto gap_bytes            = ProtectGapBytes();
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
@@ -300,11 +316,16 @@ struct PageManager::Impl {
 				potential_range_bytes += PAGE_SIZE;
 			}
 
+			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if (range_bytes != 0 && potential_range_bytes - range_bytes > gap_bytes &&
+			    !(update && watcher_edge && old_perms != new_perms)) {
+				release_pending();
+			}
+
 			if (!update) {
 				continue;
 			}
 
-			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
