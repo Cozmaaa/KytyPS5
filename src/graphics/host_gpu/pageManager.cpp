@@ -1,13 +1,17 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/assert.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <string>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -191,10 +195,75 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		const bool stats = ProtectStatsEnabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}
+		if (stats) {
+			RecordProtect(size, (static_cast<uint32_t>(mode) & static_cast<uint32_t>(Common::VirtualMemory::Mode::Write)) != 0,
+			              std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+			                  .count());
+		}
+	}
+
+	// Diagnostics (KYTY_PROTECT_STATS=1): protection changes, split by direction (a downgrade
+	// that takes write access away, an upgrade that gives it back) and by thread (the GPU thread or
+	// another, a write fault's), logged every 2 s.
+	static bool ProtectStatsEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_PROTECT_STATS");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled;
+	}
+	static void RecordProtect(uint64_t size, bool writable, int64_t ns) {
+		struct Bucket {
+			std::atomic<uint64_t> calls {0}, pages {0}, ns {0};
+		};
+		static std::array<Bucket, 4> buckets; // [gpu thread][writable]
+		static std::atomic<int64_t>  window_start {0};
+		const bool gpu    = GuestGpu::IsGpuThread();
+		// KYTY_PROTECT_STACKS=N: the host stacks of the first N GPU-thread downgrades of 16 pages or more.
+		static const uint32_t stacks = [] {
+			const char* value = std::getenv("KYTY_PROTECT_STACKS");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		}();
+		static std::atomic<uint32_t> stacked {0};
+		if (gpu && !writable && size >= 16 * PAGE_SIZE && stacks != 0 &&
+		    stacked.fetch_add(1, std::memory_order_relaxed) < stacks) {
+			std::printf("ProtectStack: %" PRIu64 " pages\n%s", size / PAGE_SIZE, Common::HostBacktrace().c_str());
+		}
+		auto&      bucket = buckets[(gpu ? 2u : 0u) + (writable ? 1u : 0u)];
+		bucket.calls.fetch_add(1, std::memory_order_relaxed);
+		bucket.pages.fetch_add(size / PAGE_SIZE, std::memory_order_relaxed);
+		bucket.ns.fetch_add(static_cast<uint64_t>(std::max<int64_t>(ns, 0)), std::memory_order_relaxed);
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto first = window_start.load(std::memory_order_relaxed);
+		if (first == 0) {
+			window_start.compare_exchange_strong(first, now);
+			return;
+		}
+		if (now - first < 2000 || !window_start.compare_exchange_strong(first, now)) {
+			return;
+		}
+		const double seconds = static_cast<double>(now - first) / 1000.0;
+		const char*  names[] = {"other protect", "other unprotect", "gpu protect", "gpu unprotect"};
+		std::string  line    = "ProtectStats (per s):";
+		for (uint32_t i = 0; i < 4; i++) {
+			const auto calls = buckets[i].calls.exchange(0);
+			const auto pages = buckets[i].pages.exchange(0);
+			const auto spent = buckets[i].ns.exchange(0);
+			char       part[160];
+			std::snprintf(part, sizeof(part), " %s %.0f calls %.0f pages %.2f ms;", names[i],
+			              static_cast<double>(calls) / seconds, static_cast<double>(pages) / seconds,
+			              static_cast<double>(spent) / seconds / 1e6);
+			line += part;
+		}
+		std::printf("%s\n", line.c_str());
 	}
 
 	template <bool track, bool is_read, bool masked>

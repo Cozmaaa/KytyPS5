@@ -127,6 +127,8 @@ public:
 	// KYTY_CLEAR_CHECK_WRITERS=1: the tag (g_gpu_write_tag) and tick of the latest GPU write that
 	// overlaps the range, false when none is recorded.
 	bool LastGpuWriter(uint64_t vaddr, uint64_t size, uint64_t& tag, uint64_t& tick);
+	// Diagnostics: buffer syncs and uploads so far (GPU thread).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> SyncUploads() const;
 	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
 	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
 	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
@@ -250,6 +252,27 @@ private:
 	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	// MarkClearChecked ranges: begin -> end. Guarded and erased with m_known_fills.
 	std::map<uint64_t, uint64_t>                        m_clear_checked;
+	// SyncBatch (BeginSyncBatch, FlushSyncBatch): uploads recorded together.
+	struct PendingSyncCopy {
+		vk::Buffer source;
+		vk::Buffer destination;
+		uint64_t   destination_size = 0;
+		uint32_t   first_copy       = 0;
+		uint32_t   copy_count       = 0;
+	};
+	// SynchronizeCpuDirtyBuffersInRange scratch: each buffer's dirty span.
+	struct WalkSpan {
+		BufferId id;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::vector<WalkSpan>                               m_walk_spans;
+	bool                                                m_sync_batching = false;
+	uint64_t                                            m_sync_batch_tick = 0;
+	std::vector<PendingSyncCopy>                        m_sync_batch;
+	std::vector<vk::BufferCopy>                         m_sync_batch_copies;
+	void                                                BeginSyncBatch();
+	void                                                FlushSyncBatch();
 	// KYTY_CLEAR_CHECK_WRITERS=1: GPU writes, begin -> (end, tag, tick); newest wins on overlap.
 	struct GpuWriter {
 		uint64_t end  = 0;

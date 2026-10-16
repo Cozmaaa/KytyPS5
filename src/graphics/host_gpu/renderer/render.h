@@ -199,6 +199,7 @@ public:
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
 	void                           FindBuffers(PreparedBindings& bindings);
+	void                           PrepareBdaBindings(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
@@ -256,6 +257,8 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	std::vector<GuestRange>               m_bda_ranges;       // PrepareBdaBindings scratch
+	std::vector<GuestRange>               m_bda_stage_ranges;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
 

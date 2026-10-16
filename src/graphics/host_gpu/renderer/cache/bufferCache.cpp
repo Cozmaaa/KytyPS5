@@ -778,8 +778,12 @@ struct SyncStats {
 	double   walk_s     = 0.0;
 };
 SyncStats g_sync_stats;
+uint64_t  g_sync_calls_total   = 0; // BufferCache::SyncUploads (GPU thread)
+uint64_t  g_sync_uploads_total = 0;
 
 void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
+	g_sync_calls_total++;
+	g_sync_uploads_total += uploaded ? 1 : 0;
 	auto& st = g_sync_stats;
 	st.calls++;
 	st.uploads += uploaded ? 1 : 0;
@@ -805,6 +809,10 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 	}
 }
 } // namespace
+
+std::pair<uint64_t, uint64_t> BufferCache::SyncUploads() const {
+	return {g_sync_calls_total, g_sync_uploads_total};
+}
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
@@ -833,7 +841,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
-	if (source) {
+	if (source && m_sync_batching) {
+		// SyncBatch: recorded with the batch's other copies (FlushSyncBatch). Their staging is
+		// watched by the recording they were made in; one submitted mid-walk (a staging ring wrap
+		// within the walk) would let it be reused before the copies run, so it is reported.
+		if (m_scheduler.CurrentTick() != m_sync_batch_tick) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1) < 16) {
+				LOGF("BufferCache: a recording was submitted inside a sync batch (tick %" PRIu64 " -> %" PRIu64 ")\n",
+				     m_sync_batch_tick, m_scheduler.CurrentTick());
+			}
+		}
+		m_sync_batch.push_back({source, buffer.Handle(), buffer.Size(),
+		                        static_cast<uint32_t>(m_sync_batch_copies.size()),
+		                        static_cast<uint32_t>(copies.size())});
+		m_sync_batch_copies.insert(m_sync_batch_copies.end(), copies.begin(), copies.end());
+	} else if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -865,6 +888,59 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+// A walk over many buffers (RenderContext::PrepareBda) records their uploads together: one end of
+// the render pass and one barrier pair around all the copies, not one of each per buffer (~75
+// uploads a walk, ~5 walks a frame in UFC 5 fights). KYTY_SYNC_BATCH=0: one at a time, as before.
+void BufferCache::BeginSyncBatch() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_BATCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	m_sync_batching  = enabled;
+	m_sync_batch_tick = m_scheduler.CurrentTick();
+}
+
+void BufferCache::FlushSyncBatch() {
+	m_sync_batching = false;
+	if (m_sync_batch.empty()) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("Sync::BatchCopy");
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Recorder();
+	std::vector<vk::BufferMemoryBarrier> barriers;
+	barriers.reserve(m_sync_batch.size());
+	for (const auto& entry: m_sync_batch) {
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = entry.destination;
+		before.offset              = 0;
+		before.size                = entry.destination_size;
+		barriers.push_back(before);
+	}
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr,
+	                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
+	for (const auto& entry: m_sync_batch) {
+		native.copyBuffer(entry.source, entry.destination, entry.copy_count,
+		                  m_sync_batch_copies.data() + entry.first_copy);
+	}
+	for (auto& barrier: barriers) {
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	}
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr,
+	                       static_cast<uint32_t>(barriers.size()), barriers.data(), 0, nullptr);
+	m_sync_batch.clear();
+	m_sync_batch_copies.clear();
 }
 
 // Reads guest memory for an upload. The guest can unmap memory a cached buffer still covers: AMM
@@ -1669,6 +1745,47 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only the buffers over runs of CPU-dirty pages: synchronizing every buffer of a region that
+	// holds any dirty page was ~2,450 buffer syncs a walk for ~75 uploads in UFC 5 fights, ~1.6 ms
+	// a walk and ~5 walks a frame (RenderContext::PrepareBda). The same buffers upload either way.
+	// KYTY_BDA_WALK_RUNS=0: every buffer of each maybe-dirty region, as before.
+	static const bool runs = [] {
+		const char* value = std::getenv("KYTY_BDA_WALK_RUNS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (runs) {
+		// The runs come in address order and buffers do not overlap: each buffer over one or more
+		// runs is synchronized once, from its first dirty byte to its last (one upload, as the
+		// region walk made it; a sync per run made a buffer with several runs upload several times).
+		m_walk_spans.clear();
+		m_memory_tracker.ForEachCpuDirtyRun(vaddr, size, [this](uint64_t address, uint64_t bytes) {
+			const auto end = address + bytes;
+			auto       it  = m_buffers.upper_bound(address);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < end; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				const auto  start  = std::max(buffer.CpuAddress(), address);
+				const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+				if (start >= finish) {
+					continue;
+				}
+				if (!m_walk_spans.empty() && m_walk_spans.back().id == it->second) {
+					m_walk_spans.back().end = finish;
+				} else {
+					m_walk_spans.push_back({it->second, start, finish});
+				}
+			}
+		});
+		BeginSyncBatch();
+		for (const auto& span: m_walk_spans) {
+			(void)SynchronizeBuffer(m_slot_buffers[span.id], span.begin, span.end - span.begin, false,
+			                        false);
+		}
+		FlushSyncBatch();
+		return;
+	}
 	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);

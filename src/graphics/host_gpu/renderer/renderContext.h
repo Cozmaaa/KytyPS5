@@ -65,6 +65,9 @@ public:
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
 	void               PrepareBda();
+	// Only the ranges a draw's or dispatch's BDA loads can read (IR::EvaluateBdaReadPlan): their
+	// CPU-dirty buffers are synchronized. False when it cannot (PrepareBda then walks them all).
+	bool               PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

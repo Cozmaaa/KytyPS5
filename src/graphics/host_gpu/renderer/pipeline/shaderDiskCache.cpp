@@ -191,6 +191,30 @@ void Visit(Io& io, T& v) {
 }
 
 template <typename Io, typename T>
+requires Is<T, IR::BdaReadWord>
+void Visit(Io& io, T& v) {
+	io(v.kind);
+	io(v.value);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::BdaReadSpan>
+void Visit(Io& io, T& v) {
+	io(v.low);
+	io(v.high);
+	io(v.begin);
+	io(v.end);
+	io(v.scalar_base);
+}
+
+template <typename Io, typename T>
+requires Is<T, IR::BdaReadPlan>
+void Visit(Io& io, T& v) {
+	io(v.spans);
+	io(v.complete);
+}
+
+template <typename Io, typename T>
 requires Is<T, IR::BindingLayout>
 void Visit(Io& io, T& v) {
 	io(v.push_data_start_dword);
@@ -215,6 +239,7 @@ void Visit(Io& io, T& v) {
 	io(v.has_address_writes);
 	io(v.info);
 	io(v.bindings);
+	io(v.bda_read_plan);
 }
 
 template <typename Io, typename T>
@@ -381,7 +406,8 @@ static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
 static_assert(sizeof(IR::BindingLayout) == 72);
 // (table_refusal, table_slots and table_global are not serialized: AddPermutation sets them.)
-static_assert(sizeof(IR::CompiledShaderInfo) == 312);
+static_assert(sizeof(IR::BdaReadPlan) == 32);
+static_assert(sizeof(IR::CompiledShaderInfo) == 344);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);

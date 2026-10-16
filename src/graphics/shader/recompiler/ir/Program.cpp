@@ -139,6 +139,7 @@ Program& Program::operator=(Program&& other) noexcept {
 }
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
+	auto bda_read_plan = BuildBdaReadPlan(*this); // (before info moves: it reads info.uses_dma)
 	CompiledShaderInfo result {
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
@@ -150,6 +151,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
+	result.bda_read_plan = std::move(bda_read_plan);
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
 			result.param_export_mask |= 1u << output.index;

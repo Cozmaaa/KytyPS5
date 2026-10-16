@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
@@ -605,6 +606,9 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	// What its flat and global loads can read (BuildBdaReadPlan): a draw's BDA preparation then
+	// synchronizes only those ranges.
+	BdaReadPlan                   bda_read_plan;
 	// Table mode census (KYTY_TABLE_CENSUS=1, BindingLayout.h: TableEligibility), set when the
 	// permutation is registered; not serialized. A TableRefusal, the SRT slot count and whether
 	// it reads flat or global memory.

@@ -592,7 +592,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
-		m_context.PrepareBda();
+		PreparedBindings* const stage = &bindings;
+		PrepareBdaBindings({&stage, 1});
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -784,7 +785,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		PreparedBindings* const stage = &bindings;
+		PrepareBdaBindings({&stage, 1});
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);

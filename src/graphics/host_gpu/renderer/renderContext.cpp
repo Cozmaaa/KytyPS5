@@ -10,6 +10,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -203,8 +204,16 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_BDA_SYNC_EVERY");
 		return value != nullptr && value[0] == '1';
 	}();
+	// KYTY_BDA_SYNC_PER_FRAME=1 (diagnostics, an upper bound: not safe in general): walk at most once
+	// per guest frame (frame-done submission) instead of once per submission.
+	static const bool per_frame = [] {
+		const char* value = std::getenv("KYTY_BDA_SYNC_PER_FRAME");
+		return value != nullptr && value[0] == '1';
+	}();
 	if (epoch != m_bda_synced_epoch && !sync_every) {
-		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		const auto submission = per_frame && m_gpu != nullptr
+		                            ? static_cast<uint64_t>(m_gpu->GetFrameNum())
+		                            : g_guest_submission_seq.load(std::memory_order_relaxed);
 		if (submission == m_bda_synced_submission) {
 			m_fault_process_pending = true;
 			return;
@@ -215,12 +224,57 @@ void RenderContext::PrepareBda() {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
 		std::shared_lock lock(m_mapped_ranges_mutex);
+		const auto start_time = std::chrono::steady_clock::now();
+		const auto uploads    = m_buffer_cache.SyncUploads();
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
 		});
 		m_bda_synced_epoch = epoch;
+		// How often the walk runs, against submissions and frames, what it costs and uploads.
+		static uint64_t walks = 0, walk_ns = 0, walk_uploads = 0, walk_syncs = 0;
+		walk_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                     std::chrono::steady_clock::now() - start_time)
+		                                     .count());
+		walk_uploads += m_buffer_cache.SyncUploads().second - uploads.second;
+		walk_syncs += m_buffer_cache.SyncUploads().first - uploads.first;
+		if (++walks % 2048 == 0 && m_gpu != nullptr) {
+			LOGF("BDA sync walks: %" PRIu64 " (submission %" PRIu64 ", frame %d): %.1f us, %.1f buffer syncs, "
+			     "%.1f uploads a walk\n",
+			     walks, g_guest_submission_seq.load(std::memory_order_relaxed), m_gpu->GetFrameNum(),
+			     static_cast<double>(walk_ns) / 2048.0 / 1000.0, static_cast<double>(walk_syncs) / 2048.0,
+			     static_cast<double>(walk_uploads) / 2048.0);
+			walk_ns = walk_uploads = walk_syncs = 0;
+		}
 	}
 	m_fault_process_pending = true;
+}
+
+// The walk above synchronizes every CPU-dirty buffer, and its re-protection is most of the write
+// faults the game's threads take: UFC 5 standing fight, 2026-10-15, ~8,400 GPU-thread protection
+// downgrades a second over ~1.5 M pages, ~152,000 single-page write faults a second. A draw whose
+// BDA loads have a read plan needs only the buffers in its ranges. Off by default
+// (KYTY_BDA_READ_PLAN=1 turns it on): with it, UFC 5 fights lose detail (plain black shorts, black
+// heads in the crowd), so some data a draw needs is outside the ranges or the walk was syncing it
+// for another path; and it halved the protection changes without a measurable gain (2026-10-15:
+// 28.4 vs 27.7 fps standing, 11.3 vs 11.2 us a draw).
+bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BDA_READ_PLAN");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || ranges.empty() || ranges.size() > 128 ||
+	    std::ranges::any_of(ranges, [](const GuestRange& range) { return !range.Valid(); })) {
+		return false;
+	}
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
+	for (const auto& range: ranges) {
+		m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(range.address, range.size);
+	}
+	m_fault_process_pending = true;
+	return true;
 }
 
 // Diagnostics: KYTY_DUMP_GUEST=<frame>:<address>+<size>[,<address>+<size>...] (frame decimal,

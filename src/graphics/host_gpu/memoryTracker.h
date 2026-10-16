@@ -64,6 +64,26 @@ public:
 			}
 		});
 	}
+	// Calls func(address, bytes) for each run of CPU-dirty pages in the range (outside the region
+	// locks, so func may synchronize them).
+	template <typename Func>
+	void ForEachCpuDirtyRun(uint64_t vaddr, uint64_t size, Func&& func) {
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!manager->MaybeModified<DirtySource::Cpu>()) {
+				return;
+			}
+			runs.clear();
+			manager->lock.lock();
+			manager->template ForEachModifiedRange<DirtySource::Cpu, false>(
+			    manager->GetCpuAddr() + offset, bytes,
+			    [&](uint64_t address, uint64_t run) { runs.emplace_back(address, run); });
+			manager->lock.unlock();
+			for (const auto [address, run]: runs) {
+				func(address, run);
+			}
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

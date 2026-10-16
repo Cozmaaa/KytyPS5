@@ -2236,16 +2236,50 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// The stages' BDA loads see the CPU's writes: only the ranges their read plans name when every
+// stage that uses BDA has one that evaluates (IR::BdaReadPlan), every CPU-dirty buffer otherwise.
+void RenderExecutor::PrepareBdaBindings(std::span<PreparedBindings* const> stages) {
+	bool bounded  = true;
+	bool uses_dma = false;
+	m_bda_ranges.clear();
+	for (auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		if (!program.info.uses_dma) {
+			continue;
+		}
+		uses_dma = true;
+		m_bda_stage_ranges.clear();
+		if (bounded && stage->runtime->resources != nullptr &&
+		    ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, *stage->runtime->resources,
+		                                              m_bda_stage_ranges)) {
+			m_bda_ranges.insert(m_bda_ranges.end(), m_bda_stage_ranges.begin(), m_bda_stage_ranges.end());
+		} else {
+			bounded = false;
+		}
+	}
+	if (!uses_dma) {
+		return;
+	}
+	static uint64_t bounded_count = 0;
+	static uint64_t walked_count  = 0;
+	if (bounded && m_context.PrepareBdaReadRanges(m_bda_ranges)) {
+		bounded_count++;
+	} else {
+		m_context.PrepareBda();
+		walked_count++;
+	}
+	if ((bounded_count + walked_count) % 65536 == 1) {
+		LOGF("BDA preparations: %" PRIu64 " by read plan, %" PRIu64 " walked\n", bounded_count,
+		     walked_count);
+	}
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
-		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
-	if (uses_dma) {
-		m_context.PrepareBda();
-	}
+	PrepareBdaBindings(stages);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
