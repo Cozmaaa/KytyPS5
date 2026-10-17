@@ -1,5 +1,24 @@
 # KytyPS5
 
+> [!IMPORTANT]
+> **This is Cozma's fork of KytyPS5** (branch `cozma-ufc5`), made to run **EA SPORTS UFC 5**. It is
+> not the official KytyPS5 build and is not supported by the upstream project. Some changes are
+> UFC 5-specific workarounds that are not meant for upstream. Report problems with this fork here,
+> not to the upstream project.
+
+## Known issues
+
+- **Random crashes** with `vkQueueSubmit failed: ErrorDeviceLost`, either early while loading or
+  later during play. On NVIDIA the Windows System event log shows "3D WIDTH ZT Violation" from
+  `nvlddmkm`: the game draws past the width of the depth buffer. This is not fixed yet.
+- **Black triangles** appear in some runs and not in others.
+- **Slow first launch.** The Vulkan pipeline cache is rebuilt for every new build, so the first run
+  of a build loads slowly. Later runs are faster.
+- **Other games may break.** The UFC 5 workarounds (for example the FSR2 exposure texture fix) can
+  change behavior in other games.
+- **Tested on one setup only:** Windows with an NVIDIA RTX 5070 Ti. Other GPUs and operating
+  systems are untested.
+
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)

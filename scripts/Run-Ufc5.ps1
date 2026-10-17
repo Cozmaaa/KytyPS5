@@ -1,5 +1,5 @@
 param(
-    [string]$GamePath = 'E:\EA SPORTS UFC 5 01.031 PPSA03541 [DLPSGAME.COM]',
+    [string]$GamePath = 'E:\EA SPORTS UFC 5 01.031',
     [switch]$GraphicsDebug,
     [switch]$Performance,
     [switch]$RenderDoc,
