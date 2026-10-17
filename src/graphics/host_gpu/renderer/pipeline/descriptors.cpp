@@ -300,13 +300,13 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
-	const auto format           = descriptor.Format();
-	const bool resource_ok      = IsSupportedStorageImageResource(resource);
-	const bool descriptor_ok    = IsSupportedStorageTextureDescriptor(resource, descriptor);
-	const bool encoding_ok      = IsSupportedStorageTextureEncoding(resource, descriptor);
-	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
-	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	const auto format        = descriptor.Format();
+	const bool resource_ok   = IsSupportedStorageImageResource(resource);
+	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
+	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
+	const bool uint_resource = resource.numeric_class == Prospero::TextureNumericClass::Uint;
+	const bool raw_sint_storage =
+	    format == Prospero::BufferFormat::k32SInt && uint_resource && !resource.atomic64;
 	const auto numeric_class    = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;

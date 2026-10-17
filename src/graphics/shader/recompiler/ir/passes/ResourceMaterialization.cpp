@@ -546,9 +546,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		const bool raw_sint_storage =
+		    storage && format == Prospero::BufferFormat::k32SInt && !base.atomic64;
+		image.numeric_class = Prospero::SampledTextureNumericClass(format);
+
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
