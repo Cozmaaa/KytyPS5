@@ -90,6 +90,7 @@ void DrawPrepScanner::Run() {
 				return;
 			}
 			item = m_items.front();
+			Common::TraceCurrentCpu("draw preparation scanner");
 			m_items.pop_front();
 		}
 		m_queue = item.queue;
@@ -164,10 +165,22 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 	                                               pairs.size() * sizeof(uint32_t))) {
 		return false;
 	}
+	const auto opcode = (header >> 8u) & 0xffu;
+	// The scanner reads ahead of the GPU thread, so the table may not be written yet: offsets the
+	// GPU thread's handlers reject (they exit) taint the scan instead (UFC 5: an SH pair 0x401d2c00,
+	// 2026-10-17). The GPU thread reads the table again when it executes the packet.
+	const uint32_t limit = opcode == Pm4::IT_SET_SH_REG_INDIRECT       ? Pm4::SH_NUM
+	                       : opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT ? Pm4::UC_NUM
+	                                                                    : UINT32_MAX;
+	for (uint32_t i = 0; i < count && limit != UINT32_MAX; i++) {
+		const uint32_t raw = pairs[static_cast<size_t>(i) * 2u];
+		if (raw != 0xffffffffu && (raw & ~0x70000000u) >= limit) {
+			return false;
+		}
+	}
 	const auto                    local = reinterpret_cast<uint64_t>(pairs.data());
 	const std::array<uint32_t, 4> copy {static_cast<uint32_t>(local), static_cast<uint32_t>(local >> 32u),
 	                                    body[2], body[3]};
-	const auto opcode = (header >> 8u) & 0xffu;
 	(void)g_cp_op_func[opcode](*m_state->cp, header, copy.data(), 5u, 5u);
 	return true;
 }

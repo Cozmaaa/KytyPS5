@@ -28,6 +28,62 @@
 
 namespace Common {
 
+void TraceCurrentCpu(const char* name) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CPU_TRACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct State {
+		uint32_t hist[256] {};
+		uint64_t calls   = 0;
+		uint64_t last_ms = 0;
+	};
+	thread_local State state;
+	PROCESSOR_NUMBER processor {};
+	GetCurrentProcessorNumberEx(&processor);
+	state.hist[(processor.Group * 64u + processor.Number) & 255u]++;
+	if ((++state.calls & 255u) != 0) {
+		return;
+	}
+	const auto now = GetTickCount64();
+	if (state.last_ms == 0) {
+		state.last_ms = now;
+		return;
+	}
+	if (now - state.last_ms < 10000) {
+		return;
+	}
+	state.last_ms = now;
+	uint64_t total = 0;
+	for (const auto count: state.hist) {
+		total += count;
+	}
+	std::string line;
+	for (int shown = 0; shown < 6; shown++) {
+		uint32_t best = 0;
+		for (uint32_t cpu = 1; cpu < 256; cpu++) {
+			if (state.hist[cpu] > state.hist[best]) {
+				best = cpu;
+			}
+		}
+		if (state.hist[best] == 0 || total == 0) {
+			break;
+		}
+		line += " " + std::to_string(best) + ":" +
+		        std::to_string(static_cast<int>(100.0 * state.hist[best] / static_cast<double>(total))) + "%";
+		state.hist[best] = 0;
+	}
+	std::fill(std::begin(state.hist), std::end(state.hist), 0u);
+	LOGF("CpuTrace %s:%s\n", name, line.c_str());
+#else
+	(void)name;
+#endif
+}
+
 // --cpu-placement: -1 not given, 0 false, 1 true.
 static std::atomic<int> g_cli_x3d {-1};
 

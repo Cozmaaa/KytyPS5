@@ -2,6 +2,7 @@
 
 #include "common/abSwitch.h"
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -1688,6 +1689,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	Common::TraceCurrentCpu("GPU thread");
 	KYTY_PROFILER_FUNCTION();
 	TableDrawCensus census(buffer);
 	g_gpu_write_tag = GpuWriteTagDraw | buffer.GetShaders().GetPs().ps_regs.data_addr;

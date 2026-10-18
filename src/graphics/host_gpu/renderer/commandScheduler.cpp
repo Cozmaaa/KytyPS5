@@ -592,6 +592,7 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 			job = m_submit_jobs.front();
 			m_submit_jobs.pop_front();
 		}
+		Common::TraceCurrentCpu("Vulkan queue submit thread");
 		QueueSubmit(job);
 	}
 }
@@ -687,6 +688,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 			chunk = std::move(m_record_queue.front());
 			m_record_queue.pop_front();
 		}
+		Common::TraceCurrentCpu("Vulkan recording thread");
 		for (auto* command = chunk->first; command != nullptr;) {
 			auto* next = command->next;
 			command->Execute(m_worker_buffer);

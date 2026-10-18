@@ -46,6 +46,11 @@ void PlaceCurrentThread(ThreadClass cls, const char* name);
 // too. Logs the topology once.
 void InitCpuPlacement();
 
+// Diagnostics (KYTY_CPU_TRACE=1): the calling thread notes the logical processor it runs on; every
+// 10 s each traced thread logs where it ran ("CpuTrace <name>: cpu:share ..."). Call it from a hot
+// loop of the thread (it costs one processor-number read).
+void TraceCurrentCpu(const char* name);
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_
