@@ -924,8 +924,28 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	// No texture: hardware would sample whatever such a T# names. UFC 5 met one once, in a
+	// dispatch (2026-10-17, buffer cache capped at 1 GB); likely a descriptor word overwritten in
+	// guest memory by a late label write (GuestGpu::DeliverInterruptAfterLabels). It is bound
+	// as a null texture instead of ending the session.
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 16) {
+			LOGF("Texture descriptor names no texture (size 0x%" PRIx64 ", align 0x%" PRIx32
+			     ", base 0x%016" PRIx64 "), bound as null: %ux%u format=%u tile=%u "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     static_cast<uint64_t>(size.size), static_cast<uint32_t>(size.align), address,
+			     width, height, static_cast<uint32_t>(format), static_cast<uint32_t>(tile),
+			     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}

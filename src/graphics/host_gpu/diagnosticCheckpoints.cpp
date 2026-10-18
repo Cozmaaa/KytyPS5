@@ -36,13 +36,15 @@ const char* OpName(uint32_t op) {
 
 void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	std::printf("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
-	            "\n",
+	            " shaders=0x%016" PRIx64 ",0x%016" PRIx64 "\n",
 	            stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id,
 	            checkpoint.arg0, checkpoint.arg1, checkpoint.arg2, checkpoint.arg3,
-	            checkpoint.arg4);
-	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	            checkpoint.arg4, checkpoint.shader0, checkpoint.shader1);
+	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
+	     " shaders=0x%016" PRIx64 ",0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
-	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
+	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4, checkpoint.shader0,
+	     checkpoint.shader1);
 }
 
 } // namespace
