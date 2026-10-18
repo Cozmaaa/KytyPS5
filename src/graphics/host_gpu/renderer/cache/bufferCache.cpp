@@ -251,8 +251,19 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			// Memory the guest has unmapped since has nothing to receive the bytes. UFC 5 got
+			// there through a corrupted COPY_DATA address (0x0142997000 for 0x1142997000, a late
+			// label write; GuestGpu::NoteCpWrite), which ended the session here.
+			if (!Libs::LibKernel::Memory::TryWriteBacking(buffer_address + copy.srcOffset,
+			                                              mapped + (copy.dstOffset - offset),
+			                                              copy.size)) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1) < 16) {
+					LOGF("BufferCache: download to unmapped guest memory 0x%016" PRIx64
+					     "+0x%" PRIx64 " dropped\n",
+					     buffer_address + copy.srcOffset, static_cast<uint64_t>(copy.size));
+				}
+			}
 		}
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {

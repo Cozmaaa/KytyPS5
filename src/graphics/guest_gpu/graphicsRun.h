@@ -58,6 +58,14 @@ public:
 	// commands). KYTY_EOP_AFTER_LABELS=0 delivers it directly, as before.
 	void DeliverInterruptAfterLabels(Common::UniqueFunction<void>&& delivery);
 	[[nodiscard]] static bool InterruptsAfterLabels();
+	// The guest also reads fences that labels with an interrupt write early, so it can still reuse
+	// memory a deferred label write has not reached yet (a COPY_DATA address 0x1142997000 became
+	// 0x0142997000). A deferred write therefore lands only where guest memory still holds what it
+	// held when the write was deferred (or what the earlier pending write leaves); where the guest
+	// has rewritten it since, the stale write is dropped and counted. KYTY_LABEL_GUARD=0 writes
+	// regardless. GPU thread: the command processor's own writes to guest memory, which keep a
+	// pending write to the same bytes landing as on hardware (after them).
+	void NoteCpWrite(uint64_t address, uint64_t size);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -129,6 +137,13 @@ private:
 	// Label writes recorded but not yet visible to the CPU. GPU thread only.
 	std::unordered_map<uint64_t, PendingLabel> m_pending_labels;
 	uint64_t                                   m_label_sequence = 0;
+	// By label sequence: the bytes guest memory should hold when the deferred write lands, and
+	// whether the command processor wrote them in between (GPU thread only; NoteCpWrite).
+	struct LabelGuard {
+		uint64_t expected   = 0;
+		bool     cp_written = false;
+	};
+	std::unordered_map<uint64_t, LabelGuard> m_label_guards;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

@@ -239,6 +239,14 @@ std::atomic<uint64_t> g_label_writes_queued {0};
 std::atomic<uint64_t> g_label_writes_done {0};
 } // namespace
 
+static bool LabelGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LABEL_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 bool GuestGpu::LabelsDeferred() noexcept {
 	return g_labels_deferred.load(std::memory_order_relaxed);
 }
@@ -258,7 +266,22 @@ bool GuestGpu::LabelsAtCompletion() {
 void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) {
 	EXIT_IF(!IsGpuThread() || (size != 4 && size != 8));
 	g_labels_deferred.store(true, std::memory_order_relaxed);
-	const auto sequence        = ++m_label_sequence;
+	const auto sequence = ++m_label_sequence;
+	if (LabelGuardEnabled()) {
+		// What the write should find when it lands: what the earlier pending write to these bytes
+		// leaves, or what guest memory holds now (unknown, and so unguarded, where the GPU wrote).
+		uint64_t expected = 0;
+		bool     known    = false;
+		if (const auto earlier = m_pending_labels.find(address); earlier != m_pending_labels.end()) {
+			known    = earlier->second.size == size;
+			expected = earlier->second.value;
+		} else {
+			known = LibKernel::Memory::TryReadGpuCleanBacking(address, &expected, size);
+		}
+		if (known) {
+			m_label_guards[sequence] = {expected, false};
+		}
+	}
 	m_pending_labels[address] = {value, size, sequence};
 	// The completion runs on the scheduler's priority thread, which must not fault on guest
 	// memory the GPU wrote to; the write itself goes back to the GPU thread.
@@ -267,7 +290,26 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 		g_label_writes_queued.fetch_add(1, std::memory_order_relaxed);
 		(void)TrySendCommand([this, address, value, size, sequence] {
 			Timeline::Mark("label", address, value);
-			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			bool write = true;
+			if (const auto guard = m_label_guards.find(sequence); guard != m_label_guards.end()) {
+				uint64_t current = 0;
+				if (!guard->second.cp_written &&
+				    LibKernel::Memory::TryReadGpuCleanBacking(address, &current, size) &&
+				    current != guard->second.expected) {
+					write = false;
+					static uint64_t dropped = 0;
+					if (++dropped <= 16 || (dropped & 0x3ffu) == 0) {
+						LOGF("Label write dropped (%" PRIu64 "): the guest rewrote 0x%016" PRIx64
+						     " (expected 0x%" PRIx64 ", found 0x%" PRIx64 ", label 0x%" PRIx64
+						     ", %u bytes)\n",
+						     dropped, address, guard->second.expected, current, value, size);
+					}
+				}
+				m_label_guards.erase(guard);
+			}
+			if (write) {
+				std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			}
 			g_label_writes_done.fetch_add(1, std::memory_order_release);
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
@@ -275,6 +317,32 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 			}
 		});
 	});
+}
+
+void GuestGpu::NoteCpWrite(uint64_t address, uint64_t size) {
+	if (m_label_guards.empty() || !IsGpuThread()) {
+		return;
+	}
+	auto mark = [&](uint64_t label) {
+		const auto pending = m_pending_labels.find(label);
+		if (pending != m_pending_labels.end() && label + pending->second.size > address &&
+		    label < address + size) {
+			if (const auto guard = m_label_guards.find(pending->second.sequence);
+			    guard != m_label_guards.end()) {
+				guard->second.cp_written = true;
+			}
+		}
+	};
+	if (size > 256) {
+		for (const auto& [label, pending]: m_pending_labels) {
+			mark(label);
+		}
+		return;
+	}
+	// Labels are 4 or 8 bytes, 4-aligned: one starting up to 4 bytes before reaches in.
+	for (uint64_t label = (address & ~uint64_t {3}) - 4; label < address + size; label += 4) {
+		mark(label);
+	}
 }
 
 // KYTY_EOP_AFTER_LABELS, letters (default "is"; 0 = none, as before): i = end-of-pipe interrupts
@@ -600,6 +668,9 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	m_renderer.GetGpu().NoteCpWrite(reinterpret_cast<uint64_t>(dst),
+	                                write_one_address ? sizeof(uint32_t)
+	                                                  : uint64_t {dw_num} * sizeof(uint32_t));
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
@@ -627,6 +698,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.GetGpu().NoteCpWrite(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -1557,6 +1629,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
+			m_renderer.GetGpu().NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 			std::memcpy(dst, &data, sizeof(data));
 		}
 
@@ -1582,6 +1655,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
+					m_renderer.GetGpu().NoteCpWrite(reinterpret_cast<uint64_t>(dst),
+					                                uint64_t {value >> 16u} * sizeof(uint32_t));
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
@@ -1616,6 +1691,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
 					} else {
+						m_renderer.GetGpu().NoteCpWrite(reinterpret_cast<uint64_t>(dst),
+						                                sizeof(value));
 						std::memcpy(dst, &value, sizeof(value));
 					}
 
