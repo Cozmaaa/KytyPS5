@@ -821,6 +821,9 @@ void DefineModule(EmitterState& state) {
 	if (float_controls) {
 		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
 	}
+	if (state.denorm_flush_f32) {
+		state.builder.RequireCapability(spv::CapabilityDenormFlushToZero);
+	}
 	if (state.requirements.buffer_u8) {
 		state.builder.RequireExtension("SPV_KHR_8bit_storage");
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
@@ -895,7 +898,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
-	if (float_controls) {
+	if (float_controls || state.denorm_flush_f32) {
 		state.builder.RequireExtension("SPV_KHR_float_controls");
 	}
 	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
@@ -907,6 +910,10 @@ void DefineModule(EmitterState& state) {
 	if (float_controls) {
 		state.builder.AddExecutionMode(state.main_func,
 		                               spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
+	}
+	if (state.denorm_flush_f32) {
+		// The guest's MODE flushes FP32 denormals (NativeDenormFlushF32Mode).
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormFlushToZero, 32u);
 	}
 	if (state.requirements.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&

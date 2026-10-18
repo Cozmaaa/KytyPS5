@@ -232,14 +232,14 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
-	a = EmitFlushF32DenormToSignedZero(state, a);
-	b = EmitFlushF32DenormToSignedZero(state, b);
-	c = EmitFlushF32DenormToSignedZero(state, c);
+	a = EmitFlushF32DenormBeforeFpOp(state, a);
+	b = EmitFlushF32DenormBeforeFpOp(state, b);
+	c = EmitFlushF32DenormBeforeFpOp(state, c);
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormBeforeFpOp(state, product), c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return EmitFlushF32DenormToSignedZero(state, sum);
+	return EmitFlushF32DenormBeforeFpOp(state, sum);
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -526,7 +526,7 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 }
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	const auto source = EmitFlushF32DenormBeforeFpOp(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -542,22 +542,22 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32DenormBeforeFpOp(state, arg0)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32DenormBeforeFpOp(state, arg0)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Exp2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32DenormBeforeFpOp(state, arg0)});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32DenormBeforeFpOp(state, arg0)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {

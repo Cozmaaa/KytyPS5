@@ -22,6 +22,9 @@
 //   XXH64 and spirv-val result, and the plan: slots, slots the shader reads, slots the host
 //   evaluates, buffers, images, samplers, block dwords and whether it reads flat/global memory.
 // --dump-dir writes each entry's modules there as <n>_normal.spv and <n>_table.spv.
+// --hash <hex> (repeatable) replays only the entries of those shader hashes (as GpuTiming logs them).
+// --denorm-flush-f32 translates as on a device that supports 32-bit DenormFlushToZero (whatever the
+// session recorded), for KYTY_NATIVE_FTZ=1.
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -133,6 +136,23 @@ void Replay(size_t n, const std::filesystem::path& path, const Entry& entry,
             const std::filesystem::path& dump, std::FILE* out) {
 	const auto normal = Compile(entry, false);
 	Dump(dump, n, "normal", normal.spirv);
+	if (!dump.empty()) {
+		// The guest code as decoded, with the workgroup's shape.
+		ShaderRecompiler::Decoder::Program program;
+		ShaderRecompiler::Decoder::DecodeProgram(entry.code, program);
+		std::string text = fmt::format("hash {:016x} wave {}\n", entry.hash, entry.wave_size);
+		if (entry.stage == ShaderType::Compute) {
+			const auto& cs = entry.compute;
+			text += fmt::format("threads {}x{}x{} lds_dwords {} host_subgroup {} lds_storage {}\n",
+			                    cs.threads_num[0], cs.threads_num[1], cs.threads_num[2],
+			                    cs.lds_size_dwords, cs.host_subgroup_size, cs.lds_storage ? 1 : 0);
+		}
+		text += ShaderRecompiler::Decoder::ProgramToString(program);
+		if (std::FILE* file = std::fopen((dump / fmt::format("{}_guest.txt", n)).string().c_str(), "wb")) {
+			std::fwrite(text.data(), 1, text.size(), file);
+			std::fclose(file);
+		}
+	}
 	const bool valid  = !normal.spirv.empty() && ValidSpirv(normal.spirv);
 	// (From another source version the cached SPIR-V may differ legitimately.)
 	Disk::PermutationRecord record;
@@ -178,13 +198,19 @@ int main(int argc, char* argv[]) {
 	size_t                      first = 0;
 	size_t                      end   = SIZE_MAX;
 	bool                        table = false;
+	bool                        denorm_flush_f32 = false;
 	std::filesystem::path       dump;
+	std::vector<uint64_t>       hashes;
 	for (int i = 4; i < argc; i++) {
 		const std::string arg = argv[i];
-		if (arg == "--table") {
+		if (arg == "--denorm-flush-f32") {
+			denorm_flush_f32 = true;
+		} else if (arg == "--table") {
 			table = true;
 		} else if (arg == "--dump-dir" && i + 1 < argc) {
 			dump = argv[++i];
+		} else if (arg == "--hash" && i + 1 < argc) {
+			hashes.push_back(std::strtoull(argv[++i], nullptr, 16));
 		} else if (arg == "--version" && i + 1 < argc) {
 			version = std::strtoull(argv[++i], nullptr, 16);
 		} else if (arg == "--first" && i + 1 < argc) {
@@ -257,8 +283,14 @@ int main(int argc, char* argv[]) {
 		    !ReadPermutation(in, entry)) {
 			continue;
 		}
+		if (!hashes.empty() && std::ranges::find(hashes, entry.hash) == hashes.end()) {
+			continue;
+		}
 		if (!applied) {
 			ApplySession(session);
+			if (denorm_flush_f32) {
+				ShaderRecompiler::Spirv::SetDenormFlushF32Supported(true);
+			}
 			applied = true;
 		}
 		std::printf("START\t%zu\t%s\n", n, files[n].filename().string().c_str());

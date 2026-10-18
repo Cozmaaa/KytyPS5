@@ -497,7 +497,37 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
+std::atomic_bool     g_denorm_flush_f32 {false};
+
+// The guest flushes FP32 denormals on input and output (MODE.FP_DENORM bits 5:4 clear). Pixel and
+// geometry shaders always run with MODE 0xc0 (shader.cpp refuses others).
+bool GuestFlushesF32Denorms(const IR::Program& program, const ShaderStageInputInfo& input_info) {
+	switch (program.stage) {
+		case ShaderType::Compute:
+			return input_info.compute != nullptr && (input_info.compute->float_mode & 0x30u) == 0;
+		case ShaderType::Pixel:
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: return true;
+		default: return false;
+	}
+}
 } // namespace
+
+void SetDenormFlushF32Supported(bool supported) {
+	g_denorm_flush_f32.store(supported, std::memory_order_relaxed);
+}
+
+bool GetDenormFlushF32Supported() {
+	return g_denorm_flush_f32.load(std::memory_order_relaxed);
+}
+
+uint32_t NativeDenormFlushF32Mode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_NATIVE_FTZ");
+		return value == nullptr ? 0u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
+	}();
+	return mode;
+}
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
@@ -556,6 +586,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
 	}
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
+	const auto ftz_mode    = GuestFlushesF32Denorms(program, input_info) ? NativeDenormFlushF32Mode() : 0u;
+	state.denorm_flush_f32 = ftz_mode != 0 && GetDenormFlushF32Supported();
+	state.skip_f32_flush   = state.denorm_flush_f32 || ftz_mode == 2;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
