@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <string_view>
 #include <cstdlib>
 
 namespace Libs::Graphics {
@@ -131,6 +133,45 @@ static uint64_t VramTargetBytes() {
 		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {14336}) << 20u;
 	}();
 	return target;
+}
+
+uint64_t GraphicContext::ForcedShortfall(bool buffer_cache) const {
+	struct Plan {
+		double   start   = 0.0;
+		uint64_t bytes   = 0;
+		double   seconds = 0.0;
+		int      target  = 0; // 0 both, 1 textures, 2 buffers
+	};
+	static const Plan plan = [] {
+		Plan        result;
+		const char* value = std::getenv("KYTY_FORCE_SHORTFALL");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end      = nullptr;
+		result.start   = std::strtod(value, &end);
+		result.bytes   = (end != nullptr && *end == ':') ? std::strtoull(end + 1, &end, 10) << 20u : 0;
+		result.seconds = (end != nullptr && *end == ':') ? std::strtod(end + 1, &end) : 0.0;
+		if (end != nullptr && *end == ':') {
+			result.target = std::string_view(end + 1) == "tex" ? 1 : std::string_view(end + 1) == "buf" ? 2 : 0;
+		}
+		LOGF("Memory: forced shortfall of %" PRIu64 " MB for %.0f s at %.0f s (%s)\n", result.bytes >> 20u,
+		     result.seconds, result.start, result.target == 1 ? "textures" : result.target == 2 ? "buffers" : "both");
+		return result;
+	}();
+	if (plan.bytes == 0 || (plan.target == 1 && buffer_cache) || (plan.target == 2 && !buffer_cache)) {
+		return 0;
+	}
+	static const auto first = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - first).count();
+	if (elapsed < plan.start || elapsed > plan.start + plan.seconds) {
+		return 0;
+	}
+	static std::atomic<bool> logged {false};
+	if (!logged.exchange(true)) {
+		LOGF("Memory: forced shortfall now (%.0f s)\n", elapsed);
+	}
+	return plan.bytes;
 }
 
 uint64_t GraphicContext::MemoryShortfall() const {

@@ -2579,7 +2579,8 @@ void TextureCache::RunGarbageCollector() {
 		m_base_pressure_gc_memory = m_pressure_gc_memory;
 		m_base_critical_gc_memory = m_critical_gc_memory;
 	}
-	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
+	if (const auto shortfall = std::max(m_graphics.MemoryShortfall(), m_graphics.ForcedShortfall(false));
+	    shortfall != 0) {
 		const auto collectable = CollectableMemory();
 		const auto cap =
 		    std::max<uint64_t>(collectable > shortfall ? collectable - shortfall : 0, 512ull << 20u);

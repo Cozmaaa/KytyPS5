@@ -1640,7 +1640,8 @@ void BufferCache::RunGarbageCollector() {
 		m_base_trigger_gc_memory  = m_trigger_gc_memory;
 		m_base_critical_gc_memory = m_critical_gc_memory;
 	}
-	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
+	if (const auto shortfall = std::max(m_graphics.MemoryShortfall(), m_graphics.ForcedShortfall(true));
+	    shortfall != 0) {
 		const auto cap = std::max<uint64_t>(
 		    m_total_used_memory > shortfall ? m_total_used_memory - shortfall : 0, 512ull << 20u);
 		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
@@ -1659,14 +1660,27 @@ void BufferCache::RunGarbageCollector() {
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Buffers no draw or dispatch used for KYTY_BUFFER_IDLE_FRAMES frames (default 60; 0: only
+	// under memory pressure, as before) are collected whatever the cache holds. Every registered buffer keeps its pages write-tracked, and UFC 5's
+	// streaming leaves thousands of stale ones over memory the game rewrites each frame: each
+	// write faults, and each BDA walk (~5 a frame) uploads and re-protects buffers nothing reads.
+	// Under memory pressure the collector deleted ~2,400 of them, and the draws that followed
+	// cost ~6.5 instead of ~8.8 us (fight, 2026-10-17). A buffer needed again is created again.
+	// Fight route, 2 runs each: off 29.6 / 29.8 fps (8.9-9.2 us a draw), 60 frames 35.1 / 35.5
+	// (6.3 us, +19 %), 300 frames 34.3 / 35.3 (6.9 us); ~650-800 buffers held instead of ~2,700.
+	static const uint64_t idle_frames = [] {
+		const char* value = std::getenv("KYTY_BUFFER_IDLE_FRAMES");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {60};
+	}();
+	const bool over_trigger = m_total_used_memory >= m_trigger_gc_memory;
+	if (!over_trigger && (idle_frames == 0 || clock <= idle_frames)) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = over_trigger && m_total_used_memory >= m_critical_gc_memory;
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
+	const uint64_t age        = over_trigger ? std::min<uint64_t>(aggressive ? 2 : 4, clock) : idle_frames;
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;

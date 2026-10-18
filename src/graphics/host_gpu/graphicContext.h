@@ -165,6 +165,10 @@ struct GraphicContext {
 	// - everything the device holds past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
 	//   (default 14336: the emulator plans for a 16 GB card whatever card it runs on).
 	[[nodiscard]] uint64_t MemoryShortfall() const;
+	// Diagnostics: KYTY_FORCE_SHORTFALL=<start s>:<MB>:<seconds>[:tex|buf] adds a shortfall of MB
+	// for seconds, start seconds after the caches first ask, for the texture cache, the buffer
+	// cache or (no suffix) both: the collection memory pressure causes, on demand.
+	[[nodiscard]] uint64_t ForcedShortfall(bool buffer_cache) const;
 	// Whether everything the device holds (images, buffers, the driver's own) has reached percent
 	// of the device-local budget, or memory is short (MemoryShortfall). False when the driver
 	// cannot report usage and nothing is short.
