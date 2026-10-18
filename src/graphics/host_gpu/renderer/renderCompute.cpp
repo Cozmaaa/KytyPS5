@@ -1,3 +1,4 @@
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -48,6 +49,13 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+bool GuestSyncEnabled() {
+	static const Common::AbSwitch<bool> enabled("KYTY_GUEST_SYNC", [](const char* value) {
+		return value != nullptr && value[0] == '1';
+	});
+	return enabled.Get();
+}
 
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
@@ -710,7 +718,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 		                }) ||
 		    has_storage_writes;
-		if (has_storage_writes) {
+		const bool guest_sync = GuestSyncEnabled();
+		if (has_storage_writes && !guest_sync) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 			// while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -727,7 +736,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!guest_sync) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	RecordComputeBufferFill(input_info, requested_groups, mode);
 	ResetBindings();
@@ -863,7 +874,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			        return image.written && image.resource_class ==
 			                                    ShaderRecompiler::IR::ImageResourceClass::Storage;
 		        });
-		if (has_storage_writes) {
+		const bool guest_sync = GuestSyncEnabled();
+		if (has_storage_writes && !guest_sync) {
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk::MemoryBarrier barrier {};
@@ -882,7 +894,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!guest_sync) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }

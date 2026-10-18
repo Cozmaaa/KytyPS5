@@ -298,6 +298,12 @@ private:
 	friend struct RenderExecutorTestAccess;
 };
 
+// KYTY_GUEST_SYNC=1 (per A/B arm, common/abSwitch.h; from the NHL 27 fork): compute dispatches
+// get no automatic barriers before writing or after running; the guest's own ordering points
+// (partial flushes and cache events, which emit global barriers already, plus ACQUIRE_MEM and
+// WAIT_REG_MEM, which do then) order them, as on the hardware.
+[[nodiscard]] bool GuestSyncEnabled();
+
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,

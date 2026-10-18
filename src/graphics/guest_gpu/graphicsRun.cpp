@@ -523,6 +523,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
+	// KYTY_GUEST_SYNC: a guest RELEASE_MEM + WAIT_REG_MEM pair orders GPU work; without the
+	// automatic dispatch barriers the wait must, since the label can be written before the GPU ran
+	// the work it releases.
+	if (GuestSyncEnabled()) {
+		EmitGlobalBarrier();
+	}
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
