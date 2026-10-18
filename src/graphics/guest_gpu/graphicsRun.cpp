@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -38,6 +39,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -115,6 +122,149 @@ static const tracy::SourceLocationData* Pm4ZoneLocation(uint32_t opcode, uint32_
 	                                             : table.ops[opcode & 0xffu];
 	return location.name != nullptr ? &location : nullptr;
 }
+
+// KYTY_GPU_BREAKDOWN=1: where the GPU thread's time goes, every 5 s: idle (no work), blocked
+// (every queue waits, WAIT_REG_MEM and the like), host commands, the PM4 loop itself and each
+// packet's handler. A diagnostic: it sizes what a command-processor thread running ahead of the
+// draws could take over. GPU thread only. UFC 5 standing fight, 2026-10-18 (3 runs alike): idle
+// 13.6 %, draws 53.7 %, dispatches 10.2 %, submission upkeep (GC, flush, bindless sync) 5.2 %, host
+// commands 6.7 %, other packets 4.0 %, register packets 4.4 %, the PM4 loop 2.0 %, WAIT_REG_MEM
+// never suspends: a CP thread could take ~6.4 % off this thread.
+class GpuBreakdown {
+public:
+	enum Bucket : uint32_t { Idle, Blocked, Commands, Process, Buckets };
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_GPU_BREAKDOWN");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled;
+	}
+	static GpuBreakdown& Get() {
+		static GpuBreakdown breakdown;
+		return breakdown;
+	}
+	static uint64_t Now() { return __rdtsc(); }
+
+	void Add(Bucket bucket, uint64_t cycles) { m_buckets[bucket] += cycles; }
+	void AddPacket(uint32_t opcode, uint32_t r, uint64_t cycles, bool suspended) {
+		const auto key = opcode == Pm4::IT_NOP ? 256u + (r & (Pm4::R_NUM - 1u)) : (opcode & 0xffu);
+		m_packets[key].cycles += cycles;
+		m_packets[key].count++;
+		m_packets[key].suspends += suspended ? 1u : 0u;
+	}
+	void AddInnerCommands(uint64_t cycles) { m_inner_commands += cycles; }
+	void AddPm4(uint64_t cycles) { m_pm4 += cycles; }
+	void CountBlockedWait() { m_blocked_waits++; }
+
+	void MaybeReport() {
+		const auto wall = std::chrono::steady_clock::now();
+		const auto now  = Now();
+		if (m_start_cycles == 0) {
+			m_start_cycles = now;
+			m_start_wall   = wall;
+			return;
+		}
+		const double seconds = std::chrono::duration<double>(wall - m_start_wall).count();
+		if (seconds < 5.0) {
+			return;
+		}
+		const double total = static_cast<double>(now - m_start_cycles);
+		const auto   pct   = [&](uint64_t cycles) { return 100.0 * static_cast<double>(cycles) / total; };
+		uint64_t     draw = 0, dispatch = 0, regs = 0, waits = 0, other = 0, handlers = 0;
+		for (uint32_t key = 0; key < m_packets.size(); key++) {
+			const auto cycles = m_packets[key].cycles;
+			handlers += cycles;
+			switch (key) {
+				case Pm4::IT_DRAW_INDIRECT:
+				case Pm4::IT_DRAW_INDEX_INDIRECT:
+				case Pm4::IT_DRAW_INDIRECT_MULTI:
+				case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				case Pm4::IT_DRAW_INDEX_2:
+				case Pm4::IT_DRAW_INDEX_OFFSET_2:
+				case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+				case Pm4::IT_DRAW_INDEX_AUTO: draw += cycles; break;
+				case Pm4::IT_DISPATCH_DIRECT:
+				case Pm4::IT_DISPATCH_INDIRECT: dispatch += cycles; break;
+				case Pm4::IT_SET_CONTEXT_REG:
+				case Pm4::IT_SET_SH_REG:
+				case Pm4::IT_SET_UCONFIG_REG:
+				case Pm4::IT_SET_UCONFIG_REG_INDEX:
+				case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+				case Pm4::IT_SET_SH_REG_INDIRECT:
+				case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+				case Pm4::IT_INDEX_BASE:
+				case Pm4::IT_INDEX_BUFFER_SIZE:
+				case Pm4::IT_INDEX_TYPE:
+				case Pm4::IT_NUM_INSTANCES:
+				case Pm4::IT_SET_BASE:
+				case Pm4::IT_CLEAR_STATE:
+				case Pm4::IT_INDIRECT_BUFFER:
+				case Pm4::IT_WRITE_CONST_RAM:
+				case Pm4::IT_INCREMENT_CE_COUNTER:
+				case Pm4::IT_INCREMENT_DE_COUNTER: regs += cycles; break;
+				case Pm4::IT_WAIT_REG_MEM:
+				case Pm4::IT_WAIT_REG_MEM_64:
+				case Pm4::IT_WAIT_ON_CE_COUNTER:
+				case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF:
+				case Pm4::IT_COND_EXEC:
+				case Pm4::IT_SET_PREDICATION: waits += cycles; break;
+				default: other += cycles; break;
+			}
+		}
+		const auto process = m_buckets[Process];
+		// The PM4 loop itself (fetch, decode, dispatch), and the rest of a submission's processing
+		// (bindless heap sync, garbage collection, flushes).
+		const auto loop    = m_pm4 > handlers + m_inner_commands ? m_pm4 - handlers - m_inner_commands : 0;
+		const auto submit  = process > m_pm4 ? process - m_pm4 : 0;
+		std::string top;
+		std::array<uint32_t, 256 + Pm4::R_NUM> order {};
+		for (uint32_t i = 0; i < order.size(); i++) {
+			order[i] = i;
+		}
+		std::partial_sort(order.begin(), order.begin() + 12, order.end(), [&](uint32_t a, uint32_t b) {
+			return m_packets[a].cycles > m_packets[b].cycles;
+		});
+		for (uint32_t i = 0; i < 12 && m_packets[order[i]].cycles != 0; i++) {
+			const auto& packet = m_packets[order[i]];
+			char        line[160];
+			std::snprintf(line, sizeof(line), " %s%02x %.1f%% (%.0f/s, %.2f us, %.0f suspends/s)",
+			              order[i] >= 256 ? "nop:" : "", order[i] & 0xffu, pct(packet.cycles),
+			              static_cast<double>(packet.count) / seconds,
+			              static_cast<double>(packet.cycles) / static_cast<double>(packet.count) /
+			                  (total / seconds) * 1e6,
+			              static_cast<double>(packet.suspends) / seconds);
+			top += line;
+		}
+		LOGF("GPU breakdown: %.1f s: idle %.1f%% blocked %.1f%% (%.0f waits/s) commands %.1f%% process "
+		     "%.1f%% = submission %.1f%% + loop %.1f%% + inner commands %.1f%% + packets: draw %.1f%% dispatch %.1f%% "
+		     "registers %.1f%% waits %.1f%% other %.1f%%; unaccounted %.1f%%; top:%s\n",
+		     seconds, pct(m_buckets[Idle]), pct(m_buckets[Blocked]),
+		     static_cast<double>(m_blocked_waits) / seconds, pct(m_buckets[Commands]), pct(process),
+		     pct(submit), pct(loop), pct(m_inner_commands), pct(draw), pct(dispatch), pct(regs), pct(waits),
+		     pct(other),
+		     100.0 - pct(m_buckets[Idle] + m_buckets[Blocked] + m_buckets[Commands] + process),
+		     top.c_str());
+		*this = {};
+		m_start_cycles = now;
+		m_start_wall   = wall;
+	}
+
+private:
+	struct Packet {
+		uint64_t cycles   = 0;
+		uint64_t count    = 0;
+		uint64_t suspends = 0;
+	};
+	std::array<uint64_t, Buckets>                m_buckets {};
+	std::array<Packet, 256 + Pm4::R_NUM>         m_packets {};
+	uint64_t                                     m_inner_commands = 0;
+	uint64_t                                     m_pm4            = 0;
+	uint64_t                                     m_blocked_waits  = 0;
+	uint64_t                                     m_start_cycles   = 0;
+	std::chrono::steady_clock::time_point        m_start_wall;
+};
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -802,8 +952,12 @@ void GuestGpu::ThreadRun(void* data) {
 	g_tracker_on_gpu_thread = true;
 	Common::SampleCurrentThread("GPU thread");
 	g_gpu_state  = gpu;
+	const bool breakdown = GpuBreakdown::Enabled();
 
 	for (;;) {
+		if (breakdown) {
+			GpuBreakdown::Get().MaybeReport();
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -814,7 +968,11 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
+				const auto idle_start = breakdown ? GpuBreakdown::Now() : 0;
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (breakdown) {
+					GpuBreakdown::Get().Add(GpuBreakdown::Idle, GpuBreakdown::Now() - idle_start);
+				}
 				Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -838,7 +996,12 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					Timeline::Mark("gpu-blocked");
+					const auto blocked_start = breakdown ? GpuBreakdown::Now() : 0;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					if (breakdown) {
+						GpuBreakdown::Get().Add(GpuBreakdown::Blocked, GpuBreakdown::Now() - blocked_start);
+						GpuBreakdown::Get().CountBlockedWait();
+					}
 					Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -865,7 +1028,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto command_start = breakdown ? GpuBreakdown::Now() : 0;
 			command();
+			if (breakdown) {
+				GpuBreakdown::Get().Add(GpuBreakdown::Commands, GpuBreakdown::Now() - command_start);
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -876,7 +1043,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto process_start = breakdown ? GpuBreakdown::Now() : 0;
+		const bool complete      = gpu->Process(submission);
+		if (breakdown) {
+			GpuBreakdown::Get().Add(GpuBreakdown::Process, GpuBreakdown::Now() - process_start);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -1040,7 +1211,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
-	ProcessPm4(execution);
+	if (GpuBreakdown::Enabled()) {
+		const auto pm4_start = GpuBreakdown::Now();
+		ProcessPm4(execution);
+		GpuBreakdown::Get().AddPm4(GpuBreakdown::Now() - pm4_start);
+	} else {
+		ProcessPm4(execution);
+	}
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -1062,9 +1239,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	if (DrawPrep::Enabled() && !draw_prep) {
 		DrawPrep::ClearCurrent();
 	}
+	const bool breakdown = GpuBreakdown::Enabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
-			g_gpu_state->ProcessCommands();
+			if (breakdown) {
+				const auto commands_start = GpuBreakdown::Now();
+				g_gpu_state->ProcessCommands();
+				GpuBreakdown::Get().AddInnerCommands(GpuBreakdown::Now() - commands_start);
+			} else {
+				g_gpu_state->ProcessCommands();
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
@@ -1190,8 +1374,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				command_zone.emplace(location);
 			}
 		}
+		const auto handler_start = breakdown ? GpuBreakdown::Now() : 0;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (breakdown) {
+			GpuBreakdown::Get().AddPacket(opcode, KYTY_PM4_R(packet_header),
+			                              GpuBreakdown::Now() - handler_start, execution.m_suspended);
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
