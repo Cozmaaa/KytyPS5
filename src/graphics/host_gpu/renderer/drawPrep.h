@@ -123,6 +123,7 @@ enum class Counter : uint32_t {
 	Tainted,          // packets scanned while the register copy was unreliable
 	TaintIndirect,    // register-indirect pairs that could not be read cleanly
 	TaintContext,     // context-state pushes and pops the scanner could not follow
+	TaintRegister,    // SET_*_REG packets whose registers the GPU thread's handlers would reject
 	Takes,            // GPU thread asked
 	Used,             // results used
 	Reused,           // results used again by a later draw of the same packet (multi-draw, retry)

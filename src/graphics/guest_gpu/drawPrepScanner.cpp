@@ -327,6 +327,15 @@ void DrawPrepScanner::Scan(const Item& item) {
 			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_UCONFIG_REG:
 			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+				// The GPU thread's handlers exit on registers they do not know; read ahead of it,
+				// such a packet may be memory the game has not written (or has reused), so it
+				// taints the scan instead, as for indirect tables (ApplyRegisterIndirect).
+				if (!CpRegisterPacketAccepted(command, packet + 1)) {
+					m_state->tainted = true;
+					DrawPrep::Add(DrawPrep::Counter::TaintRegister);
+					cursor.offset += length;
+					continue;
+				}
 				const auto consumed = g_cp_op_func[opcode](*m_state->cp, command, packet + 1, remaining, total) + 1u;
 				cursor.offset += consumed;
 				continue;

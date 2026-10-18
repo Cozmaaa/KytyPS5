@@ -396,14 +396,14 @@ void LogCountersIfDue() {
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
 	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
 	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
-	     "context %llu); GPU takes %llu, "
+	     "context %llu, register %llu); GPU takes %llu, "
 	     "used %llu (again %llu), miss none %llu / entry %llu / inputs %llu / reads %llu; verify "
 	     "%llu checks, "
 	     "%llu mismatches\n",
 	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
 	     c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
 	     c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
-	     c(Counter::TaintContext), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
+	     c(Counter::TaintContext), c(Counter::TaintRegister), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
 	     c(Counter::Reused), c(Counter::MissNone), c(Counter::MissEntry), c(Counter::MissInputs),
 	     c(Counter::MissReads),
 	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));

@@ -2580,6 +2580,81 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	return s + 1;
 }
 
+// The accept rules of the three handlers above, in the same order, without their effects.
+bool CpRegisterPacketAccepted(uint32_t cmd_id, const uint32_t* buffer) {
+	const auto opcode     = (cmd_id >> 8u) & 0xffu;
+	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	switch (opcode) {
+		case Pm4::IT_SET_CONTEXT_REG: {
+			const auto offset = NormalizeRegisterOffset(buffer[0]);
+			if (HwCtxIsFakeRegister(offset)) {
+				return true;
+			}
+			if (offset >= Pm4::CX_NUM) {
+				return false;
+			}
+			if (g_hw_ctx_func[offset & (Pm4::CX_NUM - 1)] != nullptr) {
+				return true;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::CX_NUM ||
+				    g_hw_ctx_indirect_func[(offset + i) & (Pm4::CX_NUM - 1)] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case Pm4::IT_SET_SH_REG: {
+			const auto offset = buffer[0];
+			if (offset == Pm4::SH_NOP) {
+				return true;
+			}
+			if (offset >= Pm4::SH_NUM) {
+				return false;
+			}
+			if (g_hw_sh_func[offset] != nullptr) {
+				return true;
+			}
+			if (num_values == 0) {
+				return false;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::SH_NUM || g_hw_sh_indirect_func[offset + i] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+			if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+				return true;
+			}
+			const auto raw_offset = buffer[0];
+			const auto offset     = opcode == Pm4::IT_SET_UCONFIG_REG_INDEX
+			                            ? raw_offset & 0x0fffffffu
+			                            : NormalizeRegisterOffset(raw_offset);
+			if (offset == Pm4::UC_NOP) {
+				return true;
+			}
+			if (offset >= Pm4::UC_NUM) {
+				return false;
+			}
+			if (g_hw_uc_func[offset & (Pm4::UC_NUM - 1)] != nullptr) {
+				return true;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::UC_NUM ||
+				    g_hw_uc_indirect_func[(offset + i) & (Pm4::UC_NUM - 1)] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		default: return true;
+	}
+}
+
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	KYTY_PROFILER_FUNCTION();
 
