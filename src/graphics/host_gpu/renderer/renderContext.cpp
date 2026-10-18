@@ -442,6 +442,15 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 	m_interrupt_eqs.erase(it);
 }
 
+void RenderContext::TriggerInterruptAfterLabels(int event_id, uint32_t context_id) {
+	if (m_gpu == nullptr) {
+		TriggerInterrupt(event_id, context_id);
+		return;
+	}
+	m_gpu->DeliverInterruptAfterLabels(
+	    [this, event_id, context_id] { TriggerInterrupt(event_id, context_id); });
+}
+
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	std::vector<InterruptEqRegistration> registrations;
 	{

@@ -48,6 +48,16 @@ public:
 	void DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size);
 	template <typename T>
 	[[nodiscard]] T ReadLabel(const volatile T* address) const;
+	// Labels at completion reach guest memory through the GPU thread's command queue, but an
+	// end-of-pipe interrupt was delivered straight from the scheduler's priority thread: the
+	// guest woke, took the work as done and reused its memory, and the label write still queued
+	// for that work landed afterwards, in what was by then a new command buffer (UFC 5: a
+	// SET_SH_REG header overwritten with 1, then "packet_dw > remaining_dw" or "unknown op").
+	// Priority thread: delivers the interrupt after every label write
+	// queued before it (directly when labels are not deferred, or the GPU no longer accepts
+	// commands). KYTY_EOP_AFTER_LABELS=0 delivers it directly, as before.
+	void DeliverInterruptAfterLabels(Common::UniqueFunction<void>&& delivery);
+	[[nodiscard]] static bool InterruptsAfterLabels();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,

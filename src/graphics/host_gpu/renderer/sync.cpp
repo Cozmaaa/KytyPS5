@@ -190,9 +190,11 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	// The flip completes here (the GPU thread can wait for a flip slot); the interrupt follows
+	// the label writes queued before it.
 	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
 		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
+		renderer.TriggerInterruptAfterLabels(event_id, 0);
 	});
 }
 
@@ -231,8 +233,9 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	scheduler.DeferPriorityOperation([&renderer, event_id, context_id] {
+		renderer.TriggerInterruptAfterLabels(event_id, context_id);
+	});
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

@@ -27,6 +27,10 @@ struct DiagnosticCheckpoint {
 	uint32_t arg2      = 0;
 	uint32_t arg3      = 0;
 	uint64_t arg4      = 0;
+	// The guest code addresses of the stages: vertex and pixel shader of a draw, compute shader
+	// of a dispatch (0 otherwise).
+	uint64_t shader0   = 0;
+	uint64_t shader1   = 0;
 	uint64_t sequence  = 0;
 };
 

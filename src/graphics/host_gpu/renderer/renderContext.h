@@ -73,6 +73,9 @@ public:
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void TriggerInterrupt(int event_id, uint32_t context_id);
+	// An end-of-pipe interrupt, after the label writes queued before it (GuestGpu::
+	// DeliverInterruptAfterLabels). Priority thread.
+	void TriggerInterruptAfterLabels(int event_id, uint32_t context_id);
 
 private:
 	struct InterruptEqRegistration {
