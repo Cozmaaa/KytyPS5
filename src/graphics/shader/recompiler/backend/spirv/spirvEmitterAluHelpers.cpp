@@ -251,6 +251,10 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	return ret;
 }
 
+uint32_t EmitFlushF32DenormBeforeFpOp(EmitterState& state, uint32_t value) {
+	return state.skip_f32_flush ? value : EmitFlushF32DenormToSignedZero(state, value);
+}
+
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
 	const auto fract        = state.builder.AllocateId();
 	const auto bits         = state.builder.AllocateId();

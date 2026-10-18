@@ -25,8 +25,9 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces). 3: table mode (BindingLayout::table_block_dwords,
-// CompiledShaderInfo::table_mode and table_plan).
-constexpr uint32_t FormatVersion = 3;
+// CompiledShaderInfo::table_mode and table_plan). 4: the session key records
+// GetDenormFlushF32Supported.
+constexpr uint32_t FormatVersion = 4;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -764,6 +765,7 @@ std::vector<uint8_t> SessionKey(const SessionInfo& session) {
 	key.Put(ShaderRecompiler::Spirv::GetCoherentLoadAcquire());
 	key.Put(ShaderRecompiler::Spirv::GetDeviceClockShift());
 	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().min_lod);
+	key.Put(ShaderRecompiler::Spirv::GetDenormFlushF32Supported());
 	// Every KYTY_* switch named in the recompiler's sources, with its value.
 	for (const auto name: ShaderDiskCacheVersion::RecompilerSwitches) {
 		if (name.empty()) {

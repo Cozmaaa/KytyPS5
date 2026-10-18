@@ -129,6 +129,11 @@ struct EmitterState {
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
 	uint32_t                                         wave_lds_scope          = 0;
+	// DenormFlushToZero for 32-bit floats is declared (NativeDenormFlushF32Mode): floating-point
+	// operations flush their operands and results.
+	bool                                             denorm_flush_f32        = false;
+	// EmitFlushF32DenormBeforeFpOp emits nothing: the host flushes, or KYTY_NATIVE_FTZ=2.
+	bool                                             skip_f32_flush          = false;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
@@ -582,6 +587,9 @@ uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// The flush of a value that only feeds a floating-point operation (or is the result of one): none
+// when the host flushes or KYTY_NATIVE_FTZ=2 (EmitterState::skip_f32_flush). Comparisons keep theirs.
+uint32_t EmitFlushF32DenormBeforeFpOp(EmitterState& state, uint32_t value);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 

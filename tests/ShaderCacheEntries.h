@@ -34,6 +34,7 @@ struct Session {
 	bool     coherent_load_acquire = false;
 	uint32_t clock_shift    = 0;
 	bool     min_lod        = false;
+	bool     denorm_flush_f32 = false; // format 4 on
 	// KYTY_* switches the recompiler read, with their values (nullopt: unset).
 	std::vector<std::pair<std::string, std::optional<std::string>>> switches;
 };
@@ -57,11 +58,12 @@ inline bool ReadSession(Disk::ByteReader& in, std::span<const uint8_t> key, Sess
 	if (!in.Get(magic) || !in.Get(session.format) || !in.Get(session.source_version) ||
 	    !in.Get(vendor) || !in.Get(device) || !in.Get(bindless) || !in.Get(float_atomics) ||
 	    !in.Get(session.coherent_load_acquire) || !in.Get(session.clock_shift) ||
-	    !in.Get(session.min_lod)) {
+	    !in.Get(session.min_lod) ||
+	    (session.format >= 4 && !in.Get(session.denorm_flush_f32))) {
 		return false;
 	}
 	// The switch list: (length, name, present, [length, value]) while a name follows.
-	size_t offset = 4 + 4 + 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1;
+	size_t offset = 4 + 4 + 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1 + (session.format >= 4 ? 1 : 0);
 	for (;;) {
 		if (key.size() - offset < 8 + 5) {
 			return false;
@@ -245,6 +247,7 @@ inline void ApplySession(const Session& session) {
 	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(session.coherent_load_acquire);
 	ShaderRecompiler::Spirv::SetDeviceClockShift(session.clock_shift);
 	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = session.min_lod});
+	ShaderRecompiler::Spirv::SetDenormFlushF32Supported(session.denorm_flush_f32);
 	for (const auto& [name, value]: session.switches) {
 		if (value) {
 #ifdef _WIN32

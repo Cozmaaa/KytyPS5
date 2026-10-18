@@ -641,6 +641,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
 	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
 	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	// KYTY_NATIVE_FTZ: 32-bit DenormFlushToZero while the 16- and 64-bit behavior stays as it is.
+	const bool denorm_flush_f32 =
+	    float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE &&
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
+	ShaderRecompiler::Spirv::SetDenormFlushF32Supported(denorm_flush_f32);
+	LOGF("Vulkan shaderDenormFlushToZeroFloat32: %s, shaderDenormPreserveFloat32: %s (independence "
+	     "%u), KYTY_NATIVE_FTZ: %u\n",
+	     float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? "true" : "false",
+	     float_controls.shaderDenormPreserveFloat32 == VK_TRUE ? "true" : "false",
+	     static_cast<uint32_t>(float_controls.denormBehaviorIndependence),
+	     ShaderRecompiler::Spirv::NativeDenormFlushF32Mode());
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	device_features.independentBlend                     = VK_TRUE;
