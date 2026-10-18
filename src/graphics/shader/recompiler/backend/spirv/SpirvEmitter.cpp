@@ -524,7 +524,7 @@ bool GetDenormFlushF32Supported() {
 uint32_t NativeDenormFlushF32Mode() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_NATIVE_FTZ");
-		return value == nullptr ? 0u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
+		return value == nullptr ? 2u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
 	}();
 	return mode;
 }

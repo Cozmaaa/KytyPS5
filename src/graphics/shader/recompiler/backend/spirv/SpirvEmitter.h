@@ -37,13 +37,17 @@ bool GetCoherentLoadAcquire();
 
 // The device can flush 32-bit denormals itself (shaderDenormFlushToZeroFloat32, settable apart from
 // the 16- and 64-bit behavior). The device layer sets it.
-// KYTY_NATIVE_FTZ (off by default), for shaders whose guest MODE flushes FP32 denormals:
+// KYTY_NATIVE_FTZ (default 2; 0: the explicit flushes, as before), for shaders whose guest MODE
+// flushes FP32 denormals:
 // 1: on such a device, declare DenormFlushToZero for 32-bit floats and leave out the explicit
 //    flushes in front of floating-point operations (legacy MAD/MAC, RCP, RSQ, SQRT, EXP, LOG):
 //    ~4 ALU instructions for each operand and result;
 // 2: leave them out on any device (also declaring the mode where supported). Inexact on devices
 //    that keep denormals: values below 2^-126 then survive those operations, as they already do
-//    plain V_MUL/V_ADD here. RTX 50 drivers report no 32-bit DenormFlushToZero.
+//    plain V_MUL/V_ADD here. RTX 50 drivers report no 32-bit DenormFlushToZero. UFC 5 standing
+//    fights, 2 interleaved runs each: 0: 30.8 / 30.4 fps, GPU frame 20.2 / 21.3 ms; 2: 35.9 / 35.4
+//    fps, 15.9 / 15.3 ms (with per-command GPU timing, which makes the game GPU-bound); screenshots
+//    unchanged (3d47b991). Without timing, 2 warm runs each: 0: 35.3 / 35.6, 2: 38.2 / 36.9 (+6 %).
 void     SetDenormFlushF32Supported(bool supported);
 bool     GetDenormFlushF32Supported();
 uint32_t NativeDenormFlushF32Mode();
