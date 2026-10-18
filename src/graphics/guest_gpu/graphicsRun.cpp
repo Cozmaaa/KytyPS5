@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -276,12 +277,23 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	});
 }
 
-bool GuestGpu::InterruptsAfterLabels() {
-	static const bool enabled = [] {
+// KYTY_EOP_AFTER_LABELS, letters (default "is"; 0 = none, as before): i = end-of-pipe interrupts
+// after the label writes queued before them, s = suspend-point releases likewise, l = labels with
+// an interrupt deferred too. Fight route, 90 s, one run each (2026-10-18): none 34.0 fps, i 33.2,
+// s 33.1, isl 27.3 (22.1 in another run: the game then waits for host completion of those
+// labels), l alone black (the guest's interrupt handler reads the label before it lands).
+static bool OrderingPart(char part) {
+	static const std::string parts = [] {
 		const char* value = std::getenv("KYTY_EOP_AFTER_LABELS");
-		return LabelsAtCompletion() && (value == nullptr || value[0] != '0');
+		std::string result = value != nullptr ? value : "is";
+		LOGF("Label ordering: KYTY_EOP_AFTER_LABELS=%s\n", result.c_str());
+		return result;
 	}();
-	return enabled;
+	return GuestGpu::LabelsAtCompletion() && parts.find(part) != std::string::npos;
+}
+
+bool GuestGpu::InterruptsAfterLabels() {
+	return OrderingPart('i');
 }
 
 void GuestGpu::DeliverInterruptAfterLabels(Common::UniqueFunction<void>&& delivery) {
@@ -916,7 +928,11 @@ bool GuestGpu::Process(Submission& submission) {
 			// label writes of the work before it.
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [this, ready = m_suspend_point_ready] {
-				    DeliverInterruptAfterLabels([ready] { ready->release(); });
+				    if (OrderingPart('s')) {
+					    DeliverInterruptAfterLabels([ready] { ready->release(); });
+				    } else {
+					    ready->release();
+				    }
 			    });
 			cp.BufferFlush();
 			cp.Reset();
@@ -1528,12 +1544,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
-	// A label with an interrupt was written here, early, so that the guest's interrupt handler
-	// would find it: it became visible before the deferred labels of earlier packets. Now that
-	// the interrupt follows those writes (GuestGpu::DeliverInterruptAfterLabels), it is deferred
-	// like the others and still lands before its interrupt.
+	// A label with an interrupt is written here, early, so that the guest's interrupt handler finds
+	// it (KYTY_EOP_AFTER_LABELS with l defers it too, and its interrupt follows it: correct order,
+	// but ~20 % slower).
 	const bool at_completion = GuestGpu::LabelsAtCompletion() &&
-	                           (!with_interrupt || GuestGpu::InterruptsAfterLabels());
+	                           (!with_interrupt || OrderingPart('l'));
 
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
