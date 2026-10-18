@@ -74,6 +74,9 @@ using thread_dtors_func_t           = KYTY_SYSV_ABI void (*)();
 using pthread_key_destructor_func_t = KYTY_SYSV_ABI void (*)(void*);
 
 void  PthreadInitSelfForMainThread();
+// The console's floating-point environment on the calling thread (KYTY_GUEST_MXCSR=1): MXCSR 0x9fc0
+// (flush-to-zero, denormals-are-zero, all exceptions masked) and x87 control word 0x037f.
+void  PthreadApplyGuestFpEnvironment();
 void* PthreadCreateMainGuestStack();
 void  PthreadDeleteStaticObjects(Loader::Program* program);
 

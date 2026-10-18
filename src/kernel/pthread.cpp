@@ -854,6 +854,28 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 }
 #endif
 
+// Games are built for the console's flush-to-zero and denormals-are-zero. With the host's MXCSR
+// (0x1f80) every operation that meets or makes a denormal (decaying values in animation blending,
+// physics damping, audio envelopes) takes a microcode assist of ~100+ cycles, and results differ
+// from the console's. The UFC 4 PS4 port (PORTHEON 878f7d7) and shadPS4 set 0x9fc0 / 0x037f on
+// guest threads. KYTY_GUEST_MXCSR=1 does here.
+void PthreadApplyGuestFpEnvironment() {
+#if defined(__x86_64__) || defined(_M_X64)
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_MXCSR");
+		const bool  on    = value != nullptr && value[0] == '1';
+		LOGF("Guest FP environment: %s\n", on ? "MXCSR 0x9fc0, x87 0x037f (KYTY_GUEST_MXCSR)" : "host's");
+		return on;
+	}();
+	if (!enabled) {
+		return;
+	}
+	_mm_setcsr(0x9fc0u);
+	const uint16_t control = 0x037f;
+	asm volatile("fldcw %0" : : "m"(control));
+#endif
+}
+
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
 	void*      ret = nullptr;
@@ -3221,6 +3243,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	PthreadApplyGuestFpEnvironment();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)

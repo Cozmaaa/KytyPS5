@@ -1361,6 +1361,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
+	Libs::LibKernel::PthreadApplyGuestFpEnvironment();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
