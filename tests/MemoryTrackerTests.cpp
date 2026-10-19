@@ -1,5 +1,6 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
@@ -1208,6 +1209,15 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 }
 
 } // namespace Libs::LibKernel::Memory
+
+namespace Libs::Graphics {
+
+// pageManager.cpp asks for its protect statistics; the tests run no GPU thread.
+bool GuestGpu::IsGpuThread() noexcept {
+  return false;
+}
+
+} // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
