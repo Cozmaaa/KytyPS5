@@ -89,6 +89,9 @@ if(KYTY_CLANG_CL)
 	add_compile_options("$<$<CONFIG:Release>:/O2>")
 	add_compile_options("$<$<CONFIG:Release>:/DNDEBUG>")
 	add_compile_options("$<$<CONFIG:RelWithDebInfo>:/O2>")
+	# CMake's RelWithDebInfo default /Ob1 inlines only functions marked inline, which leaves
+	# every small out-of-line helper of the render thread a call.
+	add_compile_options("$<$<CONFIG:RelWithDebInfo>:/Ob2>")
 	add_compile_options("$<$<CONFIG:RelWithDebInfo>:/DNDEBUG>")
 
 	set(KYTY_C_FLAGS "${KYTY_CPP_FLAGS}")

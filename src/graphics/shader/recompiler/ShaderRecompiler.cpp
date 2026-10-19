@@ -1,8 +1,12 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -20,8 +24,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
+#include <set>
 #include <span>
 #include <utility>
 
@@ -31,6 +39,31 @@ namespace {
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
+
+const char* StageName(ShaderType stage);
+
+// KYTY_DUMP_GAVE_UP=<folder>: write the guest code of every shader that gives up to
+// <folder>/<stage>_<hash>.bin, so it can be disassembled offline (llvm-mc -triple=amdgcn).
+void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> code) {
+	const char* folder = std::getenv("KYTY_DUMP_GAVE_UP");
+	if (folder == nullptr || code.empty()) {
+		return;
+	}
+	const auto path = fmt::format("{}/{}_{:016x}.bin", folder, StageName(options.stage),
+	                              options.shader_hash);
+	if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+}
+
+// A shader that gives up: the current compile phase turns red, and the timeline gets the reason.
+void ReportGaveUp(const CompileOptions& options, Profiler::Phases& phases, const char* reason) {
+	phases.Color(Profiler::MessageFailure);
+	Profiler::Add(Profiler::Counter::ShadersGaveUp);
+	Profiler::Message(Profiler::MessageFailure, "Shader gave up: %s 0x%016" PRIx64 ": %s",
+	                  StageName(options.stage), options.shader_hash, reason);
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
@@ -482,6 +515,7 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 } // namespace
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -492,6 +526,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
+
+	// The phases as Tracy zones, each with the stage and hash as its text.
+	Profiler::Phases phases;
+	phases.SetText("%s 0x%016" PRIx64, StageName(options.stage), options.shader_hash);
+	KYTY_PROFILER_PHASE(phases, "Shader: decode", profiler::colors::Green100);
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {
@@ -522,6 +561,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	// KYTY_DUMP_SHADER_HASHES="hash,hash,...": dump these shaders' code too (into
+	// KYTY_DUMP_GAVE_UP), for shaders that compile but are skipped later.
+	if (const char* list = std::getenv("KYTY_DUMP_SHADER_HASHES");
+	    list != nullptr &&
+	    std::string_view(list).find(fmt::format("{:016x}", options.shader_hash)) !=
+	        std::string_view::npos) {
+		DumpGaveUpCode(options, code);
+	}
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -530,9 +577,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 
+	KYTY_PROFILER_PHASE(phases, "Shader: CFG", profiler::colors::Green200);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
+	if (options.non_fatal && native_cfg.unsupported && !native_cfg.irreducible) {
+		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, native_cfg.unsupported_reason.c_str());
+		LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", GetDumpLabel(options), options.shader_hash,
+		     native_cfg.unsupported_reason.c_str());
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
@@ -586,18 +643,50 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
+	KYTY_PROFILER_PHASE(phases, "Shader: IR translate", profiler::colors::Green300);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	if (options.non_fatal && Frontend::TranslationUnsupported()) {
+		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, "no IR translation for an instruction");
+		LOGF("%s gave up hash=0x%016" PRIx64 ": no IR translation for an instruction\n",
+		     GetDumpLabel(options), options.shader_hash);
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	const auto passes_begin = std::chrono::steady_clock::now();
+	const auto ms_since     = [](std::chrono::steady_clock::time_point begin) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                 std::chrono::steady_clock::now() - begin)
+		                                 .count());
+	};
+	KYTY_PROFILER_PHASE(phases, "Shader: IR passes", profiler::colors::Green400);
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// Mask reads that fold can make select conditions and phis identical: fold until stable.
+	for (int round = 0; round < 4 && IR::FoldLaneMasks(ir) != 0; round++) {
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
+		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
+		     GetDumpLabel(options), options.shader_hash, folded);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
@@ -607,7 +696,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	LowerTessellationMemory(ir, options);
+	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
+		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
+		     GetDumpLabel(options), options.shader_hash, removed);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (!LowerTessellationMemory(ir, options)) {
+		if (!options.non_fatal) {
+			EXIT("%s failed hash=0x%016" PRIx64 ": unsupported tessellation memory shape\n",
+			     GetDumpLabel(options), options.shader_hash);
+		}
+		ReportGaveUp(options, phases, "unsupported tessellation memory shape");
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
@@ -616,7 +719,54 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	ir.bindless_images        = options.bindless_images;
+	KYTY_PROFILER_PHASE(phases, "Shader: resource tracking", profiler::colors::Amber300);
+	const auto tracking_begin = std::chrono::steady_clock::now();
+	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);
+	const auto tracking_ms    = ms_since(tracking_begin);
+	// The IR passes after translation, resource tracking among them, which the phases above miss.
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR passes tracking_ms=%" PRIu64
+	     " passes_ms=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking_ms,
+	     ms_since(passes_begin), phase_ms());
+	if (!tracked && options.non_fatal) {
+		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, "resource tracking failed");
+		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
+		     options.shader_hash);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			const auto path = Config::GetShaderLogFolder() / "rejected" /
+			                  fmt::format("{}_{:016x}.ir", StageName(options.stage), options.shader_hash);
+			Common::File::CreateDirectories(path.parent_path());
+			Common::File file(path);
+			if (!file.IsInvalid()) {
+				const auto dump = MakeIrDump(CFG::GraphToString(cfg), ir);
+				file.Write(dump.data(), dump.size());
+			}
+		}
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
+		return unsupported_result;
+	}
+	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
+	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->mesh.passes > 1u) {
+		if (const auto* reason = Spirv::MeshPassesUnsupported(ir); reason != nullptr) {
+			if (!options.non_fatal) {
+				EXIT("%s failed hash=0x%016" PRIx64 ": mesh passes: %s\n",
+				     GetDumpLabel(options), options.shader_hash, reason);
+			}
+			DumpGaveUpCode(options, code);
+			ReportGaveUp(options, phases, reason);
+			LOGF("%s gave up hash=0x%016" PRIx64 ": %u mesh passes, but %s\n",
+			     GetDumpLabel(options), options.shader_hash, options.input_info.vertex->mesh.passes,
+			     reason);
+			TranslateResult unsupported_result;
+			unsupported_result.unsupported = true;
+			return unsupported_result;
+		}
+	}
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -629,9 +779,20 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
+	Profiler::Phases phases;
+	phases.SetText("%s 0x%016" PRIx64, StageName(options.stage), options.shader_hash);
+	KYTY_PROFILER_PHASE(phases, "Shader: specialize and bind", profiler::colors::Green100);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// Table mode reads the plan's descriptor and SRT values, which the loop below drops.
+	if (options.table_mode) {
+		if (const auto refusal = IR::EnterTableMode(ir); refusal != IR::TableRefusal::Eligible) {
+			CompileResult refused;
+			refused.table_refusal = refusal;
+			return refused;
+		}
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -670,9 +831,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	IR::MarkTableSlots(ir);
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
 	                         options.input_info.compute->lds_storage);
+	// A table mode draw's shader data, the block's address among them, are push constants.
+	if (ir.table_mode && ir.bindings.ShaderDataDwords() != 0 && !ir.bindings.UsesPushData()) {
+		CompileResult refused;
+		refused.table_refusal = IR::TableRefusal::ShaderData;
+		return refused;
+	}
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
@@ -681,6 +849,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
+	KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V emit", profiler::colors::CyanA700);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
@@ -692,6 +861,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	if (ir.table_mode) {
+		result.table_refusal = IR::TableRefusal::Eligible;
+	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
 	if (options.dump_ir) {

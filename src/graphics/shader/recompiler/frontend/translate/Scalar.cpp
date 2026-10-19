@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -165,16 +166,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
-		case O::S_BCNT1_I32_B64: {
-			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
-			const auto value  = ReadU32Pair(inst.src0);
-			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[0]}));
-			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[1]}));
-			const auto result = ir.IAdd(low, high);
-			WriteOperand(inst.dst, result);
-			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
-			return;
-		}
+		case O::S_BCNT1_I32_B64:
+			return SimpleInteger(inst, IR::ValueOpcode::BitCount64, IR::Type::U64, false, false,
+			                     true);
 		case O::S_FF1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::FindILsb32, IR::Type::U32, false, false,
 			                     false);
@@ -230,8 +224,16 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_NOP:
 		case O::S_SLEEP:
-		case O::S_SETPRIO:
-		case O::S_TRAP: EmitControlNop(); return;
+		case O::S_SETPRIO: EmitControlNop(); return;
+		case O::S_TRAP:
+			// Retail GPUs run with traps disabled, so a guest assert falls through. Only a
+			// shader-call target outside the expanded set reports a trap.
+			if (inst.src0.value == Decoder::ShaderCallMissTrapCode) {
+				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value)});
+			} else {
+				EmitControlNop();
+			}
+			return;
 		case O::S_WAITCNT_DEPCTR: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
@@ -245,7 +247,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
 		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return;
 		default: return FailMissingTranslation(inst);
 	}

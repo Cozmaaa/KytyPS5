@@ -179,10 +179,33 @@
           <property name="text"><string>Auto-hide cursor</string></property>
          </widget>
         </item>
-        <item row="9" column="1">
+        <item row="12" column="1">
          <widget class="QCheckBox" name="checkBox_skip_notice_screen">
           <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
           <property name="text"><string>Skip boot logos</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_bindless">
+          <property name="toolTip"><string>Sample heap-indexed textures through bindless descriptor arrays instead of enumerating them per draw.</string></property>
+          <property name="text"><string>Bindless textures (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="11" column="1">
+         <widget class="QCheckBox" name="checkBox_cpu_placement">
+          <property name="toolTip"><string>Keeps the emulator on the V-Cache CCD of dual-CCD Ryzen X3D processors, gives the GPU and Vulkan recording threads a core each, and raises the priority of the threads they wait on. Off by default: on a single-CCD 9800X3D it was slower in UFC 5.</string></property>
+          <property name="text"><string>X3D mode (CPU placement)</string></property>
+         </widget>
+        </item>
+        <item row="10" column="0">
+         <widget class="QLabel" name="label_skip_shaders">
+          <property name="text"><string>Skip shaders:</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QLineEdit" name="lineEdit_skip_shaders">
+          <property name="toolTip"><string>Guest shader hashes (hex, comma-separated) whose draws and dispatches are left out</string></property>
+          <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
        </layout>

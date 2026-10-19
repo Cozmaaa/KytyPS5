@@ -77,7 +77,7 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  EndOfPipeWriteAction action, int interrupt_event_id = 0,
                                  uint32_t context_id = 0) {
 	EXIT_IF(destination == 0);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
@@ -101,7 +101,7 @@ void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst
 void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                            uint32_t dw_offset, uint32_t dw_num) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
 	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 }
@@ -182,7 +182,7 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
                                                   int64_t flip_arg, uint64_t request_id,
                                                   int event_id) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWriteBackFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
@@ -190,9 +190,11 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	// The flip completes here (the GPU thread can wait for a flip slot); the interrupt follows
+	// the label writes queued before it.
 	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
 		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
+		renderer.TriggerInterruptAfterLabels(event_id, 0);
 	});
 }
 
@@ -200,7 +202,7 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
                                 uint32_t value, int handle, int index, int flip_mode,
                                 int64_t flip_arg, uint64_t request_id) {
 	EXIT_IF(dst_gpu_addr == nullptr);
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
@@ -214,7 +216,7 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
                               int flip_mode, int64_t flip_arg, uint64_t request_id) {
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopOnlyFlip), submit_id,
 	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
 	                    static_cast<uint32_t>(flip_mode), 0, static_cast<uint64_t>(flip_arg));
@@ -227,12 +229,13 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 }
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
-	(void)buffer.Handle();
+	EXIT_IF(buffer.IsInvalid());
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	scheduler.DeferPriorityOperation([&renderer, event_id, context_id] {
+		renderer.TriggerInterruptAfterLabels(event_id, context_id);
+	});
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

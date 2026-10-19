@@ -1,12 +1,18 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -27,6 +33,21 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+}
+
+// KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
+// Defaults to 16 -- validated against real gameplay, where it cut the fraction of the main thread
+// spent in MasterSemaphore::Wait from dominating the frame to under 10%. Explicitly setting it to
+// 0 disables the flush entirely, same as before this had a default.
+uint32_t DrawFlushInterval() {
+	static const uint32_t interval = [] {
+		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
+		if (v == nullptr) {
+			return 16u;
+		}
+		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}();
+	return interval;
 }
 
 } // namespace
@@ -60,12 +81,12 @@ size_t CommandScheduler::CommandPool::Grow() {
 	return first;
 }
 
-vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search = [this, &gpu_tick, tick](size_t begin, size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = tick;
 				return index;
 			}
 		}
@@ -83,7 +104,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = tick;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
@@ -127,9 +148,6 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
-	if (m_gpu_profiler) {
-		GpuProfiler::Shutdown();
-	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -137,6 +155,10 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	// Every tick was waited on above, so the queue and recording threads have nothing left to
+	// submit.
+	StopRecordingThread();
+	StopSubmitThread();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -174,18 +196,53 @@ void CommandScheduler::Flush() {
 	Flush(submit);
 }
 
+void CommandScheduler::CompleteReleaseMemWrite() {
+	constexpr uint32_t WritesPerSubmission = 32;
+	if (++m_recorded_release_mem_writes < WritesPerSubmission) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
+void CommandScheduler::CompleteReleaseMemInterrupt() {
+	// Deliberately smaller than CompleteReleaseMemWrite's 32: this event has already been queued
+	// for guest delivery once its tick completes (see Sync::TriggerEopEventAtEndOfPipe ->
+	// DeferPriorityOperation), and a guest thread may be blocked waiting on it via an event queue.
+	// Batching still defers only the vkQueueSubmit -- the event fires once that (now slightly
+	// larger) submission's tick completes, same as before, just a handful of RELEASE_MEM events
+	// later instead of immediately.
+	constexpr uint32_t InterruptsPerSubmission = 8;
+	if (++m_recorded_release_mem_interrupts < InterruptsPerSubmission) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
+void CommandScheduler::CompleteDraw() {
+	const auto interval = DrawFlushInterval();
+	if (interval == 0u || ++m_recorded_draws < interval) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_PROFILER_FUNCTION();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -195,24 +252,70 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
+// How long the GPU thread spends drained on the host GPU, and how often. A drain that
+// submits the current tick first (a CPU read of GPU-owned memory mid-frame) is counted apart
+// from one that waits on already submitted work.
+namespace {
+struct WaitStats {
+	uint64_t count       = 0;
+	uint64_t drain_count = 0;
+	double   total_s     = 0.0;
+	double   drain_s     = 0.0;
+	double   max_s       = 0.0;
+};
+WaitStats g_wait_stats;
+
+void RecordWait(double seconds, bool drained) {
+	if (!GuestGpu::IsGpuThread()) {
+		return;
+	}
+	auto& stats = g_wait_stats;
+	stats.count++;
+	stats.total_s += seconds;
+	stats.max_s = std::max(stats.max_s, seconds);
+	if (drained) {
+		stats.drain_count++;
+		stats.drain_s += seconds;
+	}
+	if (stats.count % 256 == 0) {
+		LOGF("GpuWaits: count=%" PRIu64 " total=%.1fms max=%.1fms drains=%" PRIu64
+		     " drain_total=%.1fms\n",
+		     stats.count, stats.total_s * 1000.0, stats.max_s * 1000.0, stats.drain_count,
+		     stats.drain_s * 1000.0);
+		stats = {};
+	}
+}
+} // namespace
+
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
+	Common::Timer timer;
+	timer.Start();
 	if (tick == CurrentTick()) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
-		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
-		BeginNext();
+		{
+			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
+			const auto submitted_tick = Submit();
+			EXIT_IF(submitted_tick != tick);
+			Timeline::Mark("drain-begin", tick);
+			m_master.Wait(tick);
+			Timeline::Mark("drain-end", tick);
+			BeginNext();
+		}
+		RecordWait(timer.GetTimeS(), true);
 	} else {
+		Timeline::Mark("wait-begin", tick);
 		m_master.Wait(tick);
+		Timeline::Mark("wait-end", tick);
+		RecordWait(timer.GetTimeS(), false);
 	}
 }
 
 void CommandScheduler::PopPendingOperations() {
-	KYTY_PROFILER_FUNCTION();
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -225,17 +328,31 @@ void CommandScheduler::PopPendingOperations() {
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		{
-			KYTY_PROFILER_BLOCK("Wait for priority operations");
-			WaitPriorityOperations(operation.tick);
-		}
-		KYTY_PROFILER_BLOCK("Run deferred operation");
+		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
+	EXIT_IF(!operation);
+	std::unique_lock lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_pending_operations.push({std::move(operation), CurrentTick()});
+		return;
+	}
+	if (g_deferred_callback_scheduler == this) {
+		lock.unlock();
+		operation();
+		return;
+	}
+	m_operation_available.wait(lock,
+	                           [this] { return m_operation_state == OperationState::Closed; });
+	lock.unlock();
+	operation();
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
@@ -269,6 +386,7 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "Vulkan priority operations thread");
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -285,6 +403,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		Timeline::Mark("tick-done", operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -341,36 +460,93 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
-	m_command.Begin();
-	if (m_gpu_profiler) {
-		// Draw and dispatch zones nest inside the command buffer's zone.
-		static constexpr tracy::SourceLocationData location {"Command buffer", TracyFunction,
-		                                                     TracyFile, __LINE__, 0};
-		GpuProfiler::Initialize(m_graphics);
-		GpuProfiler::Collect(m_command.m_buffer);
-		m_gpu_zone.Begin(m_command.m_buffer, &location);
+	m_command.m_open = true;
+	// Ticks are allocated in submit order, so this command buffer will be submitted with the
+	// current one.
+	const auto tick = m_master.CurrentTick();
+	if (m_threaded) {
+		m_command.m_buffer = nullptr;
+		Record([this, tick](vk::CommandBuffer) {
+			m_worker_buffer = m_command_pool.Commit(tick);
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+		});
+		return m_command;
 	}
+	m_command.m_buffer = m_command_pool.Commit(tick);
+	m_command.Begin();
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
-	m_gpu_zone.End();
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_graphics.queue == nullptr);
+	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
 
+	SubmitJob job {
+	    .buffer       = m_command.m_buffer,
+	    .submit       = submit,
+	    .debug_op     = m_command.m_debug_op,
+	    .debug_submit = m_command.m_debug_submit_id,
+	    .debug_arg0   = m_command.m_debug_arg0,
+	    .debug_arg1   = m_command.m_debug_arg1,
+	    .debug_arg2   = m_command.m_debug_arg2,
+	    .debug_arg3   = m_command.m_debug_arg3,
+	    .debug_arg4   = m_command.m_debug_arg4,
+	};
+	m_command.m_buffer                = nullptr;
+	m_command.m_open                  = false;
+	m_recorded_release_mem_writes     = 0;
+	m_recorded_release_mem_interrupts = 0;
+	m_recorded_draws                  = 0;
+
+	if (m_threaded) {
+		// The tick is allocated now, in order; the recording thread ends the command buffer and
+		// submits it once it has recorded everything queued before.
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		Record([this, job](vk::CommandBuffer command) mutable {
+			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
+			job.buffer = command;
+			QueueSubmit(job);
+			m_worker_buffer = nullptr;
+		});
+		DispatchChunk();
+		ReportRecording();
+		return job.tick;
+	}
+	if (!m_async_submit) {
+		QueueSubmit(job);
+		return job.tick;
+	}
+	{
+		// Ticks are allocated in queue order and the queue thread submits in that order, so the
+		// timeline is signaled in order.
+		std::lock_guard lock(m_submit_mutex);
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		m_submit_jobs.push_back(job);
+	}
+	m_submit_available.notify_one();
+	return job.tick;
+}
+
+void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	auto&      graphics = m_graphics;
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
+		if (!m_async_submit) {
+			job.tick = m_master.NextTick();
+			job.submit.AddSignal(m_master.Handle(), job.tick);
+		}
+		const auto& submit = job.submit;
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -384,23 +560,203 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
 		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.pCommandBuffers      = &job.buffer;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Timeline::Mark("vk-submit", job.tick);
 
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics);
+	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit,
+		                  job.debug_arg0, job.debug_arg1, job.debug_arg2, job.debug_arg3,
+		                  job.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	return tick;
+void CommandScheduler::EnableAsyncSubmit() {
+	// The owner enables it while constructing, before any other thread can submit.
+	EXIT_IF(m_async_submit);
+	m_async_submit  = true;
+	m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "Vulkan queue submit thread");
+	for (;;) {
+		SubmitJob job;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			// A stop request still submits the queued jobs: their ticks may already be waited on.
+			if (!m_submit_available.wait(lock, stop, [this] { return !m_submit_jobs.empty(); })) {
+				return;
+			}
+			job = m_submit_jobs.front();
+			m_submit_jobs.pop_front();
+		}
+		Common::TraceCurrentCpu("Vulkan queue submit thread");
+		QueueSubmit(job);
+	}
+}
+
+void CommandScheduler::StopSubmitThread() {
+	if (m_submit_thread.joinable()) {
+		m_submit_thread.request_stop();
+		m_submit_thread.join();
+	}
+	std::lock_guard lock(m_submit_mutex);
+	EXIT_IF(!m_submit_jobs.empty());
+}
+
+void CommandScheduler::EnableRecordingThread() {
+	// The owner enables it while constructing, before the first command buffer.
+	EXIT_IF(m_record_thread.joinable() || m_async_submit || !m_command.IsInvalid());
+	// QueueSubmit then takes the tick Submit() allocated, as for the queue thread.
+	m_async_submit  = true;
+	m_threaded      = true;
+	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+}
+
+void* CommandScheduler::Allocate(size_t size, size_t alignment) {
+	EXIT_IF(!m_threaded || size > Chunk::Size);
+	const auto take = [this] {
+		std::lock_guard lock(m_record_mutex);
+		if (m_free_chunks.empty()) {
+			return std::make_unique<Chunk>();
+		}
+		auto chunk = std::move(m_free_chunks.back());
+		m_free_chunks.pop_back();
+		return chunk;
+	};
+	if (m_chunk == nullptr) {
+		m_chunk = take();
+	}
+	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
+	if (offset + size > Chunk::Size) {
+		DispatchChunk();
+		m_chunk = take();
+		offset  = 0;
+	}
+	m_chunk->used = offset + size;
+	return m_chunk->storage + offset;
+}
+
+void CommandScheduler::DispatchChunk() {
+	if (m_chunk == nullptr || m_chunk->first == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_record_mutex);
+		m_record_queue.push_back(std::move(m_chunk));
+		m_chunks_dispatched++;
+	}
+	m_record_available.notify_one();
+}
+
+vk::CommandBuffer CommandScheduler::DrainRecording() {
+	if (!m_threaded) {
+		return m_command.m_buffer;
+	}
+	KYTY_PROFILER_FUNCTION();
+	DispatchChunk();
+	std::unique_lock lock(m_record_mutex);
+	m_drains++;
+	Profiler::Add(Profiler::Counter::RecordingDrains);
+	// KYTY_RECORD_DRAIN_STACKS=1: which raw Handle() sites make the GPU thread wait (a host stack
+	// for every 4,999th drain, up to 64).
+	static const bool stacks = std::getenv("KYTY_RECORD_DRAIN_STACKS") != nullptr;
+	if (stacks && m_drains % 4999 == 0 && m_drains / 4999 <= 64) {
+		LOGF("Recording thread drain %" PRIu64 ":\n%s", m_drains,
+		     Common::HostBacktrace().c_str());
+	}
+	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+	return m_worker_buffer;
+}
+
+void CommandScheduler::RecordingThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuRecord");
+	Common::PlaceCurrentThread(Common::ThreadClass::Critical, "Vulkan recording thread");
+	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
+	// recycled only after the next two have run.
+	std::deque<std::unique_ptr<Chunk>> retained;
+	for (;;) {
+		std::unique_ptr<Chunk> chunk;
+		{
+			std::unique_lock lock(m_record_mutex);
+			// A stop request still runs the queued chunks: their ticks may already be waited on.
+			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
+				return;
+			}
+			chunk = std::move(m_record_queue.front());
+			m_record_queue.pop_front();
+		}
+		Common::TraceCurrentCpu("Vulkan recording thread");
+		for (auto* command = chunk->first; command != nullptr;) {
+			auto* next = command->next;
+			command->Execute(m_worker_buffer);
+			command->~RecordedCommand();
+			command = next;
+		}
+		chunk->first = nullptr;
+		chunk->last  = nullptr;
+		chunk->used  = 0;
+		retained.push_back(std::move(chunk));
+		std::unique_ptr<Chunk> recycled;
+		if (retained.size() > 2) {
+			recycled = std::move(retained.front());
+			retained.pop_front();
+		}
+		{
+			std::lock_guard lock(m_record_mutex);
+			if (recycled != nullptr) {
+				m_free_chunks.push_back(std::move(recycled));
+			}
+			m_chunks_executed++;
+		}
+		m_record_executed.notify_all();
+	}
+}
+
+// Every 5 s: command buffers submitted, chunks handed over, and drains (raw Handle() uses, which
+// make the GPU thread wait for the recording thread).
+void CommandScheduler::ReportRecording() {
+	m_record_report_buffers++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_record_report_time < std::chrono::seconds(5)) {
+		return;
+	}
+	uint64_t chunks = 0;
+	uint64_t drains = 0;
+	{
+		std::lock_guard lock(m_record_mutex);
+		chunks = m_chunks_dispatched;
+		drains = m_drains;
+	}
+	LOGF("Recording thread (5 s): %" PRIu64 " command buffers, %" PRIu64 " chunks, %" PRIu64
+	     " drains\n",
+	     m_record_report_buffers, chunks - m_record_report_chunks, drains - m_record_report_drains);
+	m_record_report_buffers = 0;
+	m_record_report_chunks  = chunks;
+	m_record_report_drains  = drains;
+	m_record_report_time    = now;
+}
+
+void CommandScheduler::StopRecordingThread() {
+	if (!m_record_thread.joinable()) {
+		return;
+	}
+	(void)DrainRecording();
+	m_record_thread.request_stop();
+	m_record_available.notify_all();
+	m_record_thread.join();
+	LOGF("Recording thread: %" PRIu64 " chunks, %" PRIu64 " drains\n", m_chunks_dispatched,
+	     m_drains);
 }
 
 void CommandScheduler::BeginNext() {

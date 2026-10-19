@@ -16,10 +16,12 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
 class RenderContext;
+class DrawPrepScanner;
 
 class GuestGpu final {
 public:
@@ -30,7 +32,40 @@ public:
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
+	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
+	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+
+	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
+	// host GPU has executed the work recorded before them, as on hardware, instead of when the
+	// packet is recorded. Until then the GPU thread's own label checks (WAIT_REG_MEM,
+	// COND_INDIRECT_BUFFER) see the recorded value through ReadLabel.
+	// KYTY_LABELS_AT_COMPLETION=1 enables it.
+	[[nodiscard]] static bool LabelsAtCompletion();
+	// Whether any label write has been deferred (so ReadLabel must consult the pending ones).
+	[[nodiscard]] static bool LabelsDeferred() noexcept;
+	// GPU thread.
+	void DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size);
+	template <typename T>
+	[[nodiscard]] T ReadLabel(const volatile T* address) const;
+	// Labels at completion reach guest memory through the GPU thread's command queue, but an
+	// end-of-pipe interrupt was delivered straight from the scheduler's priority thread: the
+	// guest woke, took the work as done and reused its memory, and the label write still queued
+	// for that work landed afterwards, in what was by then a new command buffer (UFC 5: a
+	// SET_SH_REG header overwritten with 1, then "packet_dw > remaining_dw" or "unknown op").
+	// Priority thread: delivers the interrupt after every label write
+	// queued before it (directly when labels are not deferred, or the GPU no longer accepts
+	// commands). KYTY_EOP_AFTER_LABELS=0 delivers it directly, as before.
+	void DeliverInterruptAfterLabels(Common::UniqueFunction<void>&& delivery);
+	[[nodiscard]] static bool InterruptsAfterLabels();
+	// The guest also reads fences that labels with an interrupt write early, so it can still reuse
+	// memory a deferred label write has not reached yet (a COPY_DATA address 0x1142997000 became
+	// 0x0142997000). A deferred write therefore lands only where guest memory still holds what it
+	// held when the write was deferred (or what the earlier pending write leaves); where the guest
+	// has rewritten it since, the stale write is dropped and counted. KYTY_LABEL_GUARD=0 writes
+	// regardless. GPU thread: the command processor's own writes to guest memory, which keep a
+	// pending write to the same bytes landing as on hardware (after them).
+	void NoteCpWrite(uint64_t address, uint64_t size);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -66,6 +101,8 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
+		uint64_t                  enqueued_seq      = 0; // g_guest_enqueued_seq when queued
 	};
 
 	void              Enqueue(Submission submission);
@@ -92,8 +129,28 @@ private:
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
 
+	struct PendingLabel {
+		uint64_t value    = 0;
+		uint32_t size     = 0;
+		uint64_t sequence = 0;
+	};
+	// Label writes recorded but not yet visible to the CPU. GPU thread only.
+	std::unordered_map<uint64_t, PendingLabel> m_pending_labels;
+	uint64_t                                   m_label_sequence = 0;
+	// By label sequence: the bytes guest memory should hold when the deferred write lands, and
+	// whether the command processor wrote them in between (GPU thread only; NoteCpWrite).
+	struct LabelGuard {
+		uint64_t expected   = 0;
+		bool     cp_written = false;
+	};
+	std::unordered_map<uint64_t, LabelGuard> m_label_guards;
+
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
+	// KYTY_DRAW_PREP: the scanner, and the number of the last graphics submission queued
+	// (under m_queue_mutex).
+	std::unique_ptr<DrawPrepScanner> m_draw_prep;
+	uint64_t                         m_prep_seq = 0;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;

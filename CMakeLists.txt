@@ -194,6 +194,62 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Profile-guided optimization (clang and clang-cl), after Jetsku's U59 build. Use a separate build
+# directory for each step:
+# 1. KYTY_PGO_GENERATE=ON builds an instrumented emulator. Run it with KYTY_PGO_FILE=<x.profraw>:
+#    it writes its counters every KYTY_PGO_DUMP_SECONDS (default 20) to that file (main.cpp), so a
+#    run stopped with TerminateProcess keeps its last complete dump.
+# 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata of the compiler's version.
+# 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator.
+# Only Kyty's own targets (declared below) get the flags: third-party code a training run does not
+# exercise (the SPIR-V optimizer, ...) keeps its normal optimization instead of being treated as
+# cold. They are compile options, not CMAKE_CXX_FLAGS.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (clang-cl; empty: search)")
+if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
+	endif()
+	if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+	endif()
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is called directly, so the profile runtime has to be named. Some clang-cl
+		# distributions do not ship it; the one of Visual Studio's LLVM of the same major version
+		# works too (KYTY_PGO_RUNTIME).
+		set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		if(NOT kyty_profile_runtime)
+			cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+			file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		# clang 19 also asks for the runtime by its new name (clang_rt.profile.lib), which the
+		# older-layout runtimes do not have; the one named above provides the same symbols.
+		add_link_options("/NODEFAULTLIB:clang_rt.profile.lib")
+	else()
+		add_link_options(-fprofile-instr-generate)
+	endif()
+	message(STATUS "PGO: instrumented build (run with KYTY_PGO_FILE=<file.profraw>)")
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+	endif()
+	# No warnings for sources without profile data (launcher, tests) or per function.
+	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -295,6 +351,55 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(local_memory_warmup_shader_source "${gpu_tiler_shader_dir}/local_memory_warmup.comp")
+set(local_memory_warmup_shader_spv "${gpu_tiler_generated_dir}/local_memory_warmup.spv")
+set(local_memory_warmup_shader_header "${gpu_tiler_generated_dir}/local_memory_warmup_spv.h")
+add_custom_command(
+	OUTPUT "${local_memory_warmup_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${local_memory_warmup_shader_spv}" "${local_memory_warmup_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${local_memory_warmup_shader_spv}
+	        -DOUTPUT=${local_memory_warmup_shader_header}
+	        -DSYMBOL=LOCAL_MEMORY_WARMUP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${local_memory_warmup_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${local_memory_warmup_shader_header}")
+
+set(dispatch_indirect_groups_shader_source "${gpu_tiler_shader_dir}/dispatch_indirect_groups.comp")
+set(dispatch_indirect_groups_shader_spv "${gpu_tiler_generated_dir}/dispatch_indirect_groups.spv")
+set(dispatch_indirect_groups_shader_header
+	"${gpu_tiler_generated_dir}/dispatch_indirect_groups_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_indirect_groups_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_indirect_groups_shader_spv}" "${dispatch_indirect_groups_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_indirect_groups_shader_spv}
+	        -DOUTPUT=${dispatch_indirect_groups_shader_header}
+	        -DSYMBOL=DISPATCH_INDIRECT_GROUPS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_indirect_groups_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+
+set(color_clear_check_shader_source "${gpu_tiler_shader_dir}/color_clear_check.comp")
+set(color_clear_check_shader_spv "${gpu_tiler_generated_dir}/color_clear_check.spv")
+set(color_clear_check_shader_header "${gpu_tiler_generated_dir}/color_clear_check_spv.h")
+add_custom_command(
+	OUTPUT "${color_clear_check_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${color_clear_check_shader_spv}" "${color_clear_check_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${color_clear_check_shader_spv}
+	        -DOUTPUT=${color_clear_check_shader_header}
+	        -DSYMBOL=COLOR_CLEAR_CHECK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${color_clear_check_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${color_clear_check_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -321,6 +426,62 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	list(APPEND gpu_blit_shader_headers "${shader_header}")
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
+
+# The shader disk cache's source version (src/shader_cache_version.cmake): a hash over the files
+# the shader recompiler is built from and the project headers they include, computed at build
+# time whenever one of them may have changed.
+file(GLOB_RECURSE shader_cache_seeds CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.inc"
+)
+list(APPEND shader_cache_seeds
+	"${KYTY_SOURCE_DIR}/graphics/shader/shader.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderDiskCache.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+)
+list(SORT shader_cache_seeds)
+# Headers the seeds may include: the step reruns when one of them changes, and fails when the
+# recompiler includes a header outside these directories.
+set(shader_cache_roots
+	"${KYTY_SOURCE_DIR}/graphics"
+	"${KYTY_SOURCE_DIR}/common"
+	"${KYTY_SOURCE_DIR}/kernel"
+)
+# "|"-separated: a ";" would split the custom command's argument.
+list(JOIN shader_cache_roots "|" shader_cache_roots_arg)
+file(GLOB_RECURSE shader_cache_headers CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/*.inc"
+	"${KYTY_SOURCE_DIR}/common/*.h"
+	"${KYTY_SOURCE_DIR}/kernel/*.h"
+)
+set(shader_cache_seeds_file "${PROJECT_BINARY_DIR}/shaderCacheSeeds.txt")
+list(JOIN shader_cache_seeds "\n" shader_cache_seeds_text)
+file(CONFIGURE OUTPUT "${shader_cache_seeds_file}" CONTENT "${shader_cache_seeds_text}\n" @ONLY)
+set(shader_cache_version_header "${PROJECT_BINARY_DIR}/shaderCacheVersion.h")
+set(shader_cache_version_stamp "${PROJECT_BINARY_DIR}/shaderCacheVersion.stamp")
+add_custom_command(
+	OUTPUT "${shader_cache_version_stamp}"
+	BYPRODUCTS "${shader_cache_version_header}"
+	COMMAND ${CMAKE_COMMAND}
+	        "-DSOURCE_DIR=${KYTY_SOURCE_DIR}"
+	        "-DSEEDS_FILE=${shader_cache_seeds_file}"
+	        "-DROOTS=${shader_cache_roots_arg}"
+	        "-DEXTRA=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_SYSTEM_PROCESSOR}"
+	        "-DOUTPUT=${shader_cache_version_header}"
+	        "-DSTAMP=${shader_cache_version_stamp}"
+	        -P "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
+	DEPENDS ${shader_cache_seeds} ${shader_cache_headers} "${shader_cache_seeds_file}"
+	        "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
+	COMMENT "Hashing the shader recompiler sources for the shader disk cache"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${shader_cache_version_stamp}" "${shader_cache_version_header}")
 
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
@@ -390,14 +551,36 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+# Offline batch translation of shaders extracted from game files; a tool, not a test.
+add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
+# Offline replay of the shader disk cache's recorded permutations; a tool, not a test.
+add_kyty_full_emulator_test(shader_cache_replay_tool "${KYTY_TESTS_DIR}/ShaderCacheReplayTool.cpp")
+add_kyty_full_emulator_test(shader_table_mode_tests "${KYTY_TESTS_DIR}/ShaderTableModeTests.cpp")
+# UFC 5's shader disk cache folder (_ShaderCache/PPSA03541) for shader_table_mode_tests' recorded
+# shaders; without it that part is skipped.
+set(KYTY_UFC_SHADER_CACHE "" CACHE PATH "UFC 5 shader disk cache folder for shader_table_mode_tests")
+if(KYTY_CLANG_CL)
+	# Symbols for the stack it prints when a shader crashes it.
+	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"
+		"/PDB:${CMAKE_CURRENT_BINARY_DIR}/shader_batch_tool.pdb")
+endif()
+# Times the driver's compile of SPIR-V modules, offline; a tool, not a test.
+add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
+target_link_libraries(pipeline_build_timer Vulkan::Headers)
+# Checks the emitter's float min/max on the GPU (tests/data/float_minmax_check.spvasm); a tool.
+add_executable(float_minmax_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FloatMinMaxCheck.cpp")
+target_link_libraries(float_minmax_check Vulkan::Headers)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt common)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -430,6 +613,16 @@ add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
 target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
+
+if (WIN32)
+	# Guest loads from protected pages, completed by the instruction emulator (Windows contexts).
+	add_executable(x64_load_emulation_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/X64LoadEmulationTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(x64_load_emulation_tests common Zydis::Zydis)
+	target_include_directories(x64_load_emulation_tests PRIVATE ${inc_headers})
+endif()
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -469,9 +662,25 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt common)
+target_link_libraries(resource_materialization_tests fmt::fmt common Tracy::TracyClient)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+
+add_executable(srt_native_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SrtNativeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
+)
+target_link_libraries(srt_native_tests fmt::fmt Tracy::TracyClient)
+target_include_directories(srt_native_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
@@ -479,6 +688,9 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
@@ -604,6 +816,12 @@ if(NOT KYTY_CLANG_CL)
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
+	# Resource tracking gives a shader up by throwing (Fail, caught in TrackResources); utils.cmake
+	# turns exceptions off for clang and GCC, while clang-cl builds have them on (/EHsc). Every
+	# target that compiles the file, the emulator included, needs them on.
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(BUILD_TESTING)
@@ -619,6 +837,11 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_table_mode COMMAND $<TARGET_FILE:shader_table_mode_tests>)
+	if (KYTY_UFC_SHADER_CACHE)
+		set_tests_properties(shader_table_mode PROPERTIES
+			ENVIRONMENT "KYTY_UFC_SHADER_CACHE=${KYTY_UFC_SHADER_CACHE}")
+	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -627,10 +850,14 @@ if(BUILD_TESTING)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
+	if (WIN32)
+		add_test(NAME x64_load_emulation COMMAND $<TARGET_FILE:x64_load_emulation_tests>)
+	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME srt_native COMMAND $<TARGET_FILE:srt_native_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -698,6 +925,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_table_mode_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
@@ -709,6 +937,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
+		srt_native_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
@@ -727,6 +956,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if (WIN32)
+		add_dependencies(kyty_tests x64_load_emulation_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

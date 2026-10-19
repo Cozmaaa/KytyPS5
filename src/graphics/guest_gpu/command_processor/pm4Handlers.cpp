@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -86,6 +87,48 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 	if (unknown != 0) {
 		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
 	}
+}
+
+// SET_*_REG_INDIRECT register pairs live in guest memory the GPU may also write. On a page that
+// is protected because the GPU wrote some of its bytes, every load of the pair loop faults and the
+// fault handler emulates it, so one packet can cost many exceptions. In UFC 5 fights the CX
+// packets alone took ~15 us each and 30% of the GPU thread (Tracy, 2026-10-10), while the
+// draw-prep scanner, which copies the same pairs out first, ran them at ~0.2 us.
+// On the GPU thread the pairs are copied with one clean-backing read, as the scanner does. When
+// the bytes may be GPU-written the copy is refused and the handler reads guest memory directly,
+// as before, so the fault path still downloads them first.
+// KYTY_INDIRECT_CLEAN_COPY=0 always reads guest memory directly.
+bool IndirectCleanCopyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_CLEAN_COPY");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Indirect register pairs: clean copy %s (KYTY_INDIRECT_CLEAN_COPY)\n", on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+// Only the GPU thread counts, so plain counters suffice; logged every 2^20 packets.
+uint64_t g_indirect_copied = 0;
+uint64_t g_indirect_direct = 0;
+
+const uint32_t* IndirectRegisterPairs(const uint32_t* guest_pairs, uint32_t num_pairs) {
+	// The draw-prep scanner hands these handlers its own host copy; only the GPU thread reads
+	// guest memory here.
+	if (!IndirectCleanCopyEnabled() || !GuestGpu::IsGpuThread()) {
+		return guest_pairs;
+	}
+	KYTY_PROFILER_BLOCK("IndirectRegisterPairs (clean copy)");
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(static_cast<size_t>(num_pairs) * 2u);
+	const bool copied = LibKernel::Memory::TryReadGpuCleanBacking(
+	    reinterpret_cast<uint64_t>(guest_pairs), copy.data(), copy.size() * sizeof(uint32_t));
+	(copied ? g_indirect_copied : g_indirect_direct)++;
+	if (((g_indirect_copied + g_indirect_direct) & ((uint64_t {1} << 20u) - 1u)) == 0) {
+		LOGF("Indirect register pairs: %" PRIu64 " copied, %" PRIu64 " read from guest memory\n",
+		     g_indirect_copied, g_indirect_direct);
+	}
+	return copied ? copy.data() : guest_pairs;
 }
 
 } // namespace
@@ -1306,6 +1349,11 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	if (GuestSyncEnabled()) {
+		// Without the automatic dispatch barriers, the guest's cache acquire is where earlier
+		// shader writes must become visible.
+		cp.EmitGlobalBarrier();
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1476,7 +1524,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadLabel(compare_addr), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1661,13 +1709,16 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
+	const auto draw_index_register =
+	    (buffer[3] & 0x80000000u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP;
+	EXIT_NOT_IMPLEMENTED((buffer[3] & (1u << 27u)) != 0); // User-VGPR destinations.
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     draw_initiator, indexed);
+	                     draw_initiator, indexed, draw_index_register);
 
 	return 9;
 }
@@ -1826,6 +1877,15 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 
 	cp.SetFlip(f);
 	cp.Flip();
+	// Diagnostics: KYTY_FLIP_WAIT=1 waits for the GPU to finish everything before each flip,
+	// which bounds how far the GPU thread runs ahead of the GPU to one frame.
+	static const bool flip_wait = [] {
+		const char* value = std::getenv("KYTY_FLIP_WAIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (flip_wait) {
+		cp.BufferFlushAndWait();
+	}
 	return 5;
 }
 
@@ -1957,7 +2017,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -1968,6 +2028,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2027,7 +2088,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -2039,6 +2100,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	indirect_buffer             = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2090,7 +2152,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
+	const auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
@@ -2101,6 +2163,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = IndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2273,7 +2336,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
+				// The event is queued for delivery once this submission's tick completes; see
+				// CompleteReleaseMemInterrupt for the (small) batch bound used here.
+				cp.CompleteReleaseMemInterrupt();
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
@@ -2314,7 +2379,18 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+		if (interrupt_selector == 0x00 || interrupt_selector == 0x03) {
+			// WriteAtEndOfPipe already performed the guest-visible write synchronously above (no
+			// interrupt callback was scheduled for these selectors), so nothing depends on when
+			// the accumulated command buffer actually reaches the GPU -- safe to batch instead of
+			// paying a host vkQueueSubmit for every single fence update.
+			cp.CompleteReleaseMemWrite();
+		} else {
+			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
+			// schedules a callback gated on this submission's tick actually completing on the
+			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
+			// behind a batching window.
+			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
 			cp.BufferFlush();
 		}
 
@@ -2334,6 +2410,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
+			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
 			cp.BufferFlush();
 		}
 
@@ -2503,6 +2580,81 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	return s + 1;
 }
 
+// The accept rules of the three handlers above, in the same order, without their effects.
+bool CpRegisterPacketAccepted(uint32_t cmd_id, const uint32_t* buffer) {
+	const auto opcode     = (cmd_id >> 8u) & 0xffu;
+	const auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	switch (opcode) {
+		case Pm4::IT_SET_CONTEXT_REG: {
+			const auto offset = NormalizeRegisterOffset(buffer[0]);
+			if (HwCtxIsFakeRegister(offset)) {
+				return true;
+			}
+			if (offset >= Pm4::CX_NUM) {
+				return false;
+			}
+			if (g_hw_ctx_func[offset & (Pm4::CX_NUM - 1)] != nullptr) {
+				return true;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::CX_NUM ||
+				    g_hw_ctx_indirect_func[(offset + i) & (Pm4::CX_NUM - 1)] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case Pm4::IT_SET_SH_REG: {
+			const auto offset = buffer[0];
+			if (offset == Pm4::SH_NOP) {
+				return true;
+			}
+			if (offset >= Pm4::SH_NUM) {
+				return false;
+			}
+			if (g_hw_sh_func[offset] != nullptr) {
+				return true;
+			}
+			if (num_values == 0) {
+				return false;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::SH_NUM || g_hw_sh_indirect_func[offset + i] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+			if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+				return true;
+			}
+			const auto raw_offset = buffer[0];
+			const auto offset     = opcode == Pm4::IT_SET_UCONFIG_REG_INDEX
+			                            ? raw_offset & 0x0fffffffu
+			                            : NormalizeRegisterOffset(raw_offset);
+			if (offset == Pm4::UC_NOP) {
+				return true;
+			}
+			if (offset >= Pm4::UC_NUM) {
+				return false;
+			}
+			if (g_hw_uc_func[offset & (Pm4::UC_NUM - 1)] != nullptr) {
+				return true;
+			}
+			for (uint32_t i = 0; i < num_values; i++) {
+				if (offset + i >= Pm4::UC_NUM ||
+				    g_hw_uc_indirect_func[(offset + i) & (Pm4::UC_NUM - 1)] == nullptr) {
+					return false;
+				}
+			}
+			return true;
+		}
+		default: return true;
+	}
+}
+
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2562,6 +2714,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
+	++g_gpu_wait_seq;
 
 	return payload_dw;
 }

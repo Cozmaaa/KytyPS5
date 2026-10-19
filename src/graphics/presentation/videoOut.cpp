@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -858,6 +859,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Common::PlaceCurrentThread(Common::ThreadClass::High, "present thread");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
@@ -1253,15 +1255,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
-		m_presenter.Renderer().GetTextureCache().AdvanceFrame();
-
-		if (tracy::ProfilerAvailable()) {
-			static uint64_t last_tick = 0;
-			const uint64_t  tick      = m_presenter.Renderer().GetCommandScheduler().CurrentTick();
-			TracyPlot("Ticks per frame", static_cast<int64_t>(tick - last_tick));
-			last_tick = tick;
-			FrameMark;
-		}
+		Profiler::MarkFrame();
 	}
 
 	m_mutex.Lock();

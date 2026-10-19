@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -512,6 +513,49 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+// Waits on a waiter's condition variable until ready() or the deadline, dispatching pending signals.
+// Windows times condition-variable waits in whole milliseconds on the system tick, so a ~5 ms wait
+// woke up to ~1 ms late: the Bink sound thread, which paces its 5.33 ms grains with such waits,
+// fell to 0.93x real time and the intro videos' sound crackled (issue #5). The last 2.5 ms are
+// timed with the high-resolution timer in slices of at most 0.5 ms (a wake-up in that stretch is
+// seen within a slice) and a short yield loop.
+template <class Lock, class Ready>
+static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
+                          std::chrono::steady_clock::time_point deadline) {
+	constexpr auto coarse_margin = std::chrono::microseconds(2500);
+	constexpr auto spin_margin   = std::chrono::microseconds(300);
+	constexpr auto fine_slice    = std::chrono::microseconds(500);
+	while (!ready()) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			break;
+		}
+		const auto remaining = deadline - now;
+		if (remaining > coarse_margin) {
+			cv.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+			                      remaining - coarse_margin,
+			                      std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		} else {
+			lock.unlock();
+			if (remaining > spin_margin) {
+				const auto slice = std::min<std::chrono::steady_clock::duration>(
+				    remaining - spin_margin, fine_slice);
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(slice).count()));
+			} else {
+				std::this_thread::yield();
+			}
+			lock.lock();
+			continue;
+		}
+		if (!ready()) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -809,6 +853,28 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 	       second_capacity_unchanged && unmapped && final_capacity_unchanged;
 }
 #endif
+
+// Games are built for the console's flush-to-zero and denormals-are-zero. With the host's MXCSR
+// (0x1f80) every operation that meets or makes a denormal (decaying values in animation blending,
+// physics damping, audio envelopes) takes a microcode assist of ~100+ cycles, and results differ
+// from the console's. The UFC 4 PS4 port (PORTHEON 878f7d7) and shadPS4 set 0x9fc0 / 0x037f on
+// guest threads. KYTY_GUEST_MXCSR=1 does here.
+void PthreadApplyGuestFpEnvironment() {
+#if defined(__x86_64__) || defined(_M_X64)
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_MXCSR");
+		const bool  on    = value != nullptr && value[0] == '1';
+		LOGF("Guest FP environment: %s\n", on ? "MXCSR 0x9fc0, x87 0x037f (KYTY_GUEST_MXCSR)" : "host's");
+		return on;
+	}();
+	if (!enabled) {
+		return;
+	}
+	_mm_setcsr(0x9fc0u);
+	const uint16_t control = 0x037f;
+	asm volatile("fldcw %0" : : "m"(control));
+#endif
+}
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -2875,26 +2941,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -2960,26 +3007,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
@@ -3209,6 +3237,7 @@ static void* RunThread(void* arg) {
 #endif
 	}
 #endif
+	KYTY_PROFILER_THREAD(thread->name.c_str());
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3223,6 +3252,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	PthreadApplyGuestFpEnvironment();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)

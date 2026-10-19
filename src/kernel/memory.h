@@ -116,8 +116,34 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
+// GPU holds it and a host read would wait for the GPU.
+[[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
+// work has written any of them, else nullptr. Current until the GPU thread marks them
+// GPU-written or the guest remaps them.
+[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Changes whenever guest mappings or their coverage change: a FindGpuCleanBacking result for an
+// address stays the same pointer until then (whether it is still GPU-clean is another matter).
+[[nodiscard]] uint64_t CleanBackingGeneration();
+// Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
+// TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
+// queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).
+void SetGpuReadDelegate(bool delegate);
+// GPU thread or delegate: copies [vaddr, vaddr + size) from the backing store when no GPU work has
+// written any of it. Never downloads, faults or waits; false otherwise.
+[[nodiscard]] bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
+// it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether every byte of the range is committed guest memory, by the kernel's own table of guest
+// mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
+// so is every range before the kernel's memory is set up (unit tests).
+[[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
@@ -177,8 +203,11 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
 int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* output,
                                                 size_t                      output_size);
 
+// [code_offset, code_offset + code_size): the module's executable segment, relative to the
+// allocation, which may use large pages (KYTY_LARGE_PAGES=1).
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
-                               Common::VirtualMemory::Mode mode, const char* name);
+                               Common::VirtualMemory::Mode mode, const char* name,
+                               uint64_t code_offset = 0, uint64_t code_size = 0);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,

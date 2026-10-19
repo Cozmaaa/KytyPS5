@@ -1,5 +1,8 @@
 #include "common/archive.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/common.h"
+#include "common/cpuAffinity.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -9,7 +12,10 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <charconv>
+#include <csignal>
+#include <exception>
 #include <cstdio>
 #include <filesystem>
 #include <string_view>
@@ -17,8 +23,54 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters only at a normal exit, but the run scripts may stop the
+// emulator with TerminateProcess. With KYTY_PGO_FILE=<file.profraw>, a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 20) to <file>.tmp and renames that over <file>, so the file always
+// holds the last complete dump.
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds =
+	    (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
+	std::thread([seconds]() {
+		for (uint32_t dump = 1;; dump++) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			const int       written = __llvm_profile_write_file();
+			std::error_code error;
+			if (written == 0) {
+				std::filesystem::rename(temp, target, error);
+			}
+			::printf("PGO: dump %u %s\n", dump,
+			         written != 0 ? "failed to write" : (error ? "failed to rename" : "written"));
+			::fflush(stdout);
+		}
+	}).detach();
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -72,6 +124,8 @@ static void PrintUsage() {
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
+	::printf("  --vulkan-validation-fatal <t|f>      Exit on the first validation error (default\n"
+	         "                                       true); false logs errors and continues.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -92,6 +146,13 @@ static void PrintUsage() {
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
+	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --cpu-placement <true|false>         X3D mode: V-Cache CCD, own cores and priorities for\n"
+	         "                                       the emulator's hot threads (default false).\n");
+	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
+	         "                                       float images (they run by default).\n");
+	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
+	         "                                       (hex hashes, as logged).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -248,6 +309,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.profiler_enabled = true;
 			continue;
 		}
+		if (arg == "--bindless") {
+			options.config.bindless_images_enabled = true;
+			continue;
+		}
+		if (arg == "--float-image-atomics" || arg == "--no-float-image-atomics") {
+			options.config.float_image_atomics_enabled = arg == "--float-image-atomics";
+			continue;
+		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
@@ -397,6 +466,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--vulkan-validation-fatal") {
+			if (!ParseBool(value, options.config.vulkan_validation_fatal)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--shader-validation") {
 			if (!ParseBool(value, options.config.shader_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -433,11 +507,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--skip-shaders") {
+			options.config.skip_shader_hashes = value;
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--cpu-placement") {
+			bool enabled = true;
+			if (!ParseBool(value, enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			Common::SetCpuPlacementEnabled(enabled);
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -473,9 +556,43 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// An abort() or std::terminate (an uncaught exception, a failed library assertion) ended the
+// process with only a WER event: no message and no stack, while the log lost its tail. Name the
+// caller and flush the log first.
+static void ReportAbort(const char* what) {
+	static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+	if (reported.test_and_set()) {
+		return;
+	}
+	Log::WriteFatal(fmt::format("--- {} ---\n{}", what, Common::HostBacktrace()));
+}
+
+static void InstallAbortReport() {
+	std::signal(SIGABRT, [](int) { ReportAbort("abort()"); });
+	std::set_terminate([] {
+		const char* reason = "std::terminate";
+		if (auto current = std::current_exception(); current != nullptr) {
+			try {
+				std::rethrow_exception(current);
+			} catch (const std::exception& e) {
+				Log::WriteFatal(fmt::format("Uncaught exception: {}\n", e.what()));
+			} catch (...) {
+				reason = "std::terminate (unknown exception)";
+			}
+		}
+		ReportAbort(reason);
+		std::abort();
+	});
+}
+
 static int Main(int argc, char* argv[]) {
+	InstallAbortReport();
 	VirtualMemory::Init();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: the thread's stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

@@ -2,56 +2,45 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUPROFILER_H_
 
 #include "common/profiler.h"
-#include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstddef>
 #include <cstdint>
 
+// The host GPU on Tracy's timeline (--profile; KYTY_PROFILE_GPU=0 turns it off): one GPU zone
+// per host draw and dispatch, named by its shader, from timestamps written through the recording
+// thread (no drain) and read back once their tick has executed. Only while a Tracy server is
+// connected. Needs hostQueryReset and calibrated timestamps, which --profile enables when the
+// device has them.
 namespace Libs::Graphics {
 
-struct GraphicContext;
+class CommandBuffer;
+class RenderContext;
 
-// Tracy GPU zones: timestamps written into the render scheduler's command buffers. They are
-// recorded only while a Tracy client is connected, so the calls are cheap otherwise.
 namespace GpuProfiler {
 
-// Creates the Tracy GPU context. Does nothing when Tracy is disabled or after the first call.
-void Initialize(GraphicContext& graphics);
-// Call after the GPU finished every command buffer with zones.
-void Shutdown();
-// Sends finished timestamps to Tracy and records query resets, so call it outside rendering.
-void Collect(vk::CommandBuffer buffer);
+namespace Detail {
+int64_t BeginSlow(RenderContext& context, CommandBuffer& buffer, const char* name, size_t size,
+                  uint32_t color);
+void    EndSlow(CommandBuffer& buffer, int64_t token);
+} // namespace Detail
 
-class Zone {
-public:
-	Zone() = default;
-	~Zone() { End(); }
-	Zone(const Zone&)            = delete;
-	Zone& operator=(const Zone&) = delete;
+// Opens a zone before a command; returns its token (negative: none opened).
+inline int64_t Begin(RenderContext& context, CommandBuffer& buffer, const char* name, size_t size,
+                     uint32_t color) {
+	if (!Profiler::g_counters) {
+		return -1;
+	}
+	return Detail::BeginSlow(context, buffer, name, size, color);
+}
 
-	void Begin(vk::CommandBuffer buffer, const tracy::SourceLocationData* location);
-	// Writes the closing timestamp into the zone's command buffer; it reports the opening thread,
-	// so a zone can end on another thread.
-	void End();
-
-private:
-	vk::CommandBuffer m_buffer;
-	uint64_t          m_connection = 0;
-	uint32_t          m_thread     = 0;
-	bool              m_active     = false;
-};
+// Closes the zone after the command.
+inline void End(CommandBuffer& buffer, int64_t token) {
+	if (token >= 0) {
+		Detail::EndSlow(buffer, token);
+	}
+}
 
 } // namespace GpuProfiler
-
 } // namespace Libs::Graphics
 
-// A GPU zone around the commands recorded into `buffer` until the end of the scope. Nothing may
-// submit or replace `buffer` inside the scope.
-#define KYTY_GPU_ZONE(buffer, name)                                                                \
-	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
-	    kyty_gpu_location_, __LINE__) {name, TracyFunction, TracyFile,                             \
-	                                   static_cast<uint32_t>(__LINE__), 0};                        \
-	Libs::Graphics::GpuProfiler::Zone KYTY_PROFILER_CONCAT(kyty_gpu_zone_, __LINE__);              \
-	KYTY_PROFILER_CONCAT(kyty_gpu_zone_, __LINE__)                                                 \
-	    .Begin(buffer, &KYTY_PROFILER_CONCAT(kyty_gpu_location_, __LINE__))
-
-#endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUPROFILER_H_ */
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUPROFILER_H_

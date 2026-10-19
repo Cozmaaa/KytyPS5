@@ -64,9 +64,13 @@ struct SpirvRequirements {
 	bool subgroup_barrier             = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
+	bool subgroup_arithmetic          = false;
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// Dwords the function-scope LDS array needs, from bounds on every LDS address; 0 when some
+	// address is unbounded.
+	uint32_t function_lds_dwords      = 0;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
@@ -75,9 +79,13 @@ struct SpirvRequirements {
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	bool shader_clock                 = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
+// KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
+bool FloatControlsDisabled(uint64_t shader_hash);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
@@ -98,7 +106,7 @@ struct EmitterState {
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
-	uint32_t                                        u64_type = 0;
+	uint32_t                                        native_u64_type = 0;
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
@@ -114,13 +122,36 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
+	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
+	// OpIsNan) then have the defined results the guest's IEEE instructions need.
+	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
 	uint32_t                                         lane_count              = 1;
+	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
+	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
+	uint32_t                                         wave_lds_scope          = 0;
+	// DenormFlushToZero for 32-bit floats is declared (NativeDenormFlushF32Mode): floating-point
+	// operations flush their operands and results.
+	bool                                             denorm_flush_f32        = false;
+	// EmitFlushF32DenormBeforeFpOp emits nothing: the host flushes, or KYTY_NATIVE_FTZ=2.
+	bool                                             skip_f32_flush          = false;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
+	// By descriptor array index; in table mode by buffer (EmitTableMode).
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// Table mode (IR::TablePlan, EmitTableMode): the value of each slot the shader reads (0: not
+	// read) and each live buffer's device address (u64 ids), at the function's entry.
+	std::vector<uint32_t>                            table_slot_values;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_buffer_bases {};
+	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
+	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
+	// instruction being emitted writes memory.
+	uint32_t                                         write_bitmap_address    = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_track_bases {};
+	bool                                             emitting_write          = false;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -136,6 +167,14 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// and the slot EmitImage computed for the instruction being emitted (0 when none).
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -143,6 +182,14 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -168,6 +215,7 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
+uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -218,12 +266,6 @@ inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);
 	return result;
-}
-
-inline uint32_t PackU64(EmitterState& state, uint32_t low, uint32_t high) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
-	return Unary(state, spv::OpBitcast, TypeU64(state), pair);
 }
 
 inline uint32_t Binary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t lhs,
@@ -285,6 +327,7 @@ struct ImageSampleLayout {
 	uint32_t lod    = NoImageComponent;
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
+	uint32_t clamp  = NoImageComponent; // IMAGE_SAMPLE*_CL minimum LOD, the last component
 };
 
 struct F32Class {
@@ -374,6 +417,7 @@ void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
+uint32_t MeshLaneSlot(EmitterState& state);
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits);
@@ -410,12 +454,18 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
+// A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+// Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
+[[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+void EmitTableMode(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
@@ -427,7 +477,19 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
+	uint32_t              write_base       = 0;
+	// Table mode: the buffer's device address (u64 id; object_pointer is unused). A load or
+	// store through its element pointers takes the Aligned operand (AlignedMemoryAccess).
+	uint32_t              bda_base         = 0;
 };
+
+// Table mode: the memory operand mask of a load or store of an access's elements, which a
+// physical pointer requires to state the element's alignment (the operand after it).
+inline uint32_t AlignedMemoryAccess(const MemoryResourceAccess& access) {
+	return static_cast<uint32_t>(access.memory_access) |
+	       static_cast<uint32_t>(spv::MemoryAccessAlignedMask);
+}
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
@@ -435,7 +497,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        uint32_t variable, uint32_t pointer_type);
+                                                        uint32_t variable, uint32_t pointer_type,
+                                                        uint32_t element_bits = 32);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
@@ -519,9 +582,15 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
+// Whether a 32-bit float is a NaN.
+uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
+
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// The flush of a value that only feeds a floating-point operation (or is the result of one): none
+// when the host flushes or KYTY_NATIVE_FTZ=2 (EmitterState::skip_f32_flush). Comparisons keep theirs.
+uint32_t EmitFlushF32DenormBeforeFpOp(EmitterState& state, uint32_t value);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 
@@ -536,6 +605,8 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

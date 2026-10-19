@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -214,6 +215,8 @@ struct AudioOut2LatencyState {
 
 static Common::Mutex                              g_audioout2_state_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
+// Held while a push outputs copies of the ports' PCM, and to close a port's handle.
+static Common::Mutex                              g_audioout2_output_mutex;
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
 static std::vector<AudioOut2UserHandle>          g_audioout2_users;
 static Common::Mutex                              g_audioout2_speaker_array_mutex;
@@ -404,36 +407,72 @@ static void audioout2_mix_object(AudioOut2ContextState&         context,
 }
 
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
-	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
-	// Keep both PCM storage and port handles alive until it returns.
-	Common::LockGuard lock(g_audioout2_state_mutex);
-	auto*             context = audioout2_find_context_locked(ctx);
-	if (context == nullptr) {
-		return;
-	}
-	context->object_mix.clear();
-	std::vector<AudioInternal::OutputParam> params;
-	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
-		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
-			continue;
+	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue
+	// (a grain, or up to 200 ms while it drains). The PCM is copied out under the state lock, so
+	// the game's mixer, which hands over the next buffers through PortSetAttributes, is not held
+	// for that time: it produced audio at ~60 % of real time in the jungle. The output lock keeps
+	// the port handles open until the backend returns.
+	struct PcmCopy {
+		std::vector<uint8_t>  pcm;
+		std::array<float, 16> gains {};
+	};
+	thread_local std::vector<PcmCopy>                     copies;
+	thread_local std::vector<AudioInternal::OutputParam> params;
+	params.clear();
+
+	Common::LockGuard output_lock(g_audioout2_output_mutex);
+	{
+		Common::LockGuard lock(g_audioout2_state_mutex);
+		auto*             context = audioout2_find_context_locked(ctx);
+		if (context == nullptr) {
+			return;
 		}
-		if (audioout2_port_type_is_object(state.port_type)) {
-			audioout2_mix_object(*context, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back({state.audio_handle, state.pcm_data.data(), state.gains.data()});
+		// The data and gains pointers are set once the copies stop moving; a non-null gains
+		// pointer only marks a port with gains until then.
+		const auto add = [](int handle, const void* data, size_t size, const float* gains) {
+			if (copies.size() <= params.size()) {
+				copies.resize(params.size() + 1);
+			}
+			auto& copy = copies[params.size()];
+			copy.pcm.assign(static_cast<const uint8_t*>(data),
+			                static_cast<const uint8_t*>(data) + size);
+			if (gains != nullptr) {
+				std::copy_n(gains, copy.gains.size(), copy.gains.begin());
+			}
+			params.push_back({handle, nullptr, gains});
+		};
+		context->object_mix.clear();
+		for (const auto& state: g_audioout2_ports) {
+			if (!state.used || state.context != ctx || state.pcm_data.empty()) {
+				continue;
+			}
+			if (audioout2_port_type_is_object(state.port_type)) {
+				audioout2_mix_object(*context, state);
+			} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
+				add(state.audio_handle, state.pcm_data.data(), state.pcm_data.size(),
+				    state.gains.data());
+			}
+		}
+		if (!context->object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
+			add(context->object_audio_handle, context->object_mix.data(),
+			    context->object_mix.size() * sizeof(float), nullptr);
 		}
 	}
-	if (!context->object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-		params.push_back({context->object_audio_handle, context->object_mix.data()});
+	for (size_t i = 0; i < params.size(); i++) {
+		params[i].data  = copies[i].pcm.data();
+		params[i].gains = params[i].gains != nullptr ? copies[i].gains.data() : nullptr;
 	}
+
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
 		                                     blocking);
 	}
 }
+
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
+		// Not while a push still outputs through the handle (see audioout2_queue_context_audio).
+		Common::LockGuard output_lock(g_audioout2_output_mutex);
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
@@ -575,7 +614,116 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
+// The queue as the hardware reports it: grains pushed and not yet played. With a real device, that
+// is what SDL still holds for the context. A push returns at once while the queue has room and
+// blocks only while it is full; the level falls as the device plays.
+//
+// The game's mixer thread renders a grain into one buffer whenever the level shows room, and
+// another thread pushes it. When the push instead slept to pace SDL with the level held at 0-1,
+// the mixer rendered three grains per push into the same buffer: two of three were lost (the
+// menu music at several times the tempo, normal pitch, crackling; issue #1).
+// KYTY_AUDIOOUT2_DEVICE_QUEUE=0 restores that timer model.
+const bool g_audioout2_device_queue = [] {
+	const char* value = std::getenv("KYTY_AUDIOOUT2_DEVICE_QUEUE");
+	return value == nullptr || value[0] != '0';
+}();
+
+// SDL may hold this much beyond the queue depth before it counts: the depth alone (4 grains, 21 ms
+// with 256-sample grains) does not cover Windows scheduling, and the device ran dry (issue #5).
+constexpr uint64_t AUDIOOUT2_DEVICE_CUSHION_US = 20000;
+
+// Microseconds the context's device still has to play (its first port with PCM and a device), or
+// -1 when it has none: then the timer model applies.
+static int64_t audioout2_device_queued_us(AudioOut2ContextHandle ctx) {
+	int handle = 0;
+	{
+		Common::LockGuard lock(g_audioout2_state_mutex);
+		const auto*       context = audioout2_find_context_locked(ctx);
+		if (context == nullptr) {
+			return -1;
+		}
+		for (const auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx && !state.pcm_data.empty()) {
+				const int port_handle = audioout2_port_type_is_object(state.port_type)
+				                            ? context->object_audio_handle
+				                            : state.audio_handle;
+				if (port_handle > 0) {
+					handle = port_handle;
+					break;
+				}
+			}
+		}
+	}
+	return handle > 0 ? AudioInternal::AudioOutQueuedUs(handle) : -1;
+}
+
+// Caller holds g_audioout2_state_mutex. The level from the device's queue, or from the timer.
+static uint32_t audioout2_level_locked(AudioOut2ContextState* state, int64_t device_queued_us) {
+	if (device_queued_us < 0) {
+		audioout2_update_context_locked(state);
+		return state->queued;
+	}
+	const auto grain_us = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	const auto beyond   = static_cast<uint64_t>(device_queued_us) > AUDIOOUT2_DEVICE_CUSHION_US
+	                          ? static_cast<uint64_t>(device_queued_us) - AUDIOOUT2_DEVICE_CUSHION_US
+	                          : 0;
+	state->queued      = static_cast<uint32_t>(
+        std::min<uint64_t>((beyond + grain_us - 1) / grain_us, state->queue_depth));
+	state->last_update = LibKernel::KernelGetProcessTime();
+	return state->queued;
+}
+
+static int audioout2_push_device_queue(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	for (;;) {
+		const auto device_us = audioout2_device_queued_us(ctx);
+
+		g_audioout2_state_mutex.Lock();
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr) {
+			g_audioout2_state_mutex.Unlock();
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		const auto level = audioout2_level_locked(state, device_us);
+		if (level < state->queue_depth) {
+			if (device_us < 0 && state->queued == 0) {
+				state->last_update = LibKernel::KernelGetProcessTime();
+			}
+			state->queued++;
+			const auto depth = state->queue_depth;
+			const auto grain = state->num_grains;
+			g_audioout2_state_mutex.Unlock();
+			// The level paces the pushes: the device takes the grain at once.
+			audioout2_queue_context_audio(ctx, device_us < 0 && blocking != 0);
+			// A blocking push returns once the queue has room for the next grain. The game's pushing
+			// thread wakes the mixer right after each push, and the mixer renders only when it sees
+			// room: returning with the queue full left the mixer asleep until the next frame woke
+			// it (300-500 ms in the jungle at ~9 fps; issue #7, the gameplay sound skipped).
+			if (blocking != 0 && device_us >= 0) {
+				const auto grain_us  = static_cast<uint64_t>(audioout2_grain_micros(grain));
+				const auto cushion   = AUDIOOUT2_DEVICE_CUSHION_US;
+				const auto full_us   = cushion + (depth - 1) * grain_us;
+				for (int64_t queued_us = audioout2_device_queued_us(ctx);
+				     queued_us >= 0 && static_cast<uint64_t>(queued_us) > full_us;
+				     queued_us = audioout2_device_queued_us(ctx)) {
+					Common::Thread::SleepMicro(500);
+				}
+			}
+			return OK;
+		}
+		g_audioout2_state_mutex.Unlock();
+
+		if (blocking == 0) {
+			return AUDIO_OUT2_ERROR_NOT_READY;
+		}
+		Common::Thread::SleepMicro(1000);
+	}
+}
+
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	if (g_audioout2_device_queue) {
+		return audioout2_push_device_queue(ctx, blocking);
+	}
+
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
@@ -619,9 +767,11 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 		*available_queues = 4;
 	}
 
+	const auto device_us = g_audioout2_device_queue ? audioout2_device_queued_us(ctx) : -1;
+
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
+		(void)audioout2_level_locked(state, device_us);
 		if (queue_level != nullptr) {
 			*queue_level = state->queued;
 		}

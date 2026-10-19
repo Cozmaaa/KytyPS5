@@ -4,9 +4,16 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <bit>
+#include <optional>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -54,7 +61,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
 	const auto shared = IR::CollectMemoryResources(program, buffers);
-	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
+	// Table mode reads its buffers and slots by device address (IR::TablePlan).
+	const bool table = program.table_mode;
+	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty() && !table;
 	if (shared.gds) {
 		Expect(Kind::Gds);
 	}
@@ -65,7 +74,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	if (IR::UsesFlattenedSrt(program)) {
+	if (IR::UsesFlattenedSrt(program) && !table) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
@@ -95,7 +104,11 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
 	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
-	    program.bindings.memory_offset_count != buffers.size() ||
+	    program.bindings.memory_offset_count != (table ? 0u : buffers.size()) ||
+	    program.bindings.table_block_dwords != (table ? 2u : 0u) ||
+	    (table && (program.bindings.write_tracking ||
+	               program.table_plan.buffers.size() != program.info.buffers.size() ||
+	               program.table_plan.gpu.size() != program.srt_reads.size())) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
@@ -188,10 +201,95 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 }
 
+// An upper bound of a U32 value built from constants, the lane id and simple integer arithmetic,
+// or nothing. Phi cycles (a loop-carried address) are unbounded.
+std::optional<uint64_t> UpperBoundU32(IR::Value value, uint32_t wave_size,
+                                      std::vector<const IR::Inst*>& visiting) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == IR::Type::U32 ? std::optional<uint64_t>(value.U32())
+		                                        : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || visiting.size() > 64u || std::ranges::find(visiting, inst) != visiting.end()) {
+		return std::nullopt;
+	}
+	visiting.push_back(inst);
+	const auto arg = [&](size_t index) { return UpperBoundU32(inst->Arg(index), wave_size, visiting); };
+	const auto immediate = [&](size_t index) -> std::optional<uint32_t> {
+		const auto operand = inst->Arg(index).Resolve();
+		return operand.IsImmediate() && operand.GetType() == IR::Type::U32
+		           ? std::optional<uint32_t>(operand.U32())
+		           : std::nullopt;
+	};
+	std::optional<uint64_t> result;
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::LaneId: result = wave_size - 1u; break;
+		case IR::ValueOpcode::IAdd32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = *a + *b;
+			}
+			break;
+		case IR::ValueOpcode::IMul32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = *a * *b;
+			}
+			break;
+		case IR::ValueOpcode::ShiftLeftLogical32:
+		case IR::ValueOpcode::ShiftRightLogical32: {
+			const auto a = arg(0);
+			const auto b = immediate(1);
+			if (a && b && *b < 32u) {
+				result = inst->GetOpcode() == IR::ValueOpcode::ShiftLeftLogical32 ? *a << *b : *a >> *b;
+			}
+			break;
+		}
+		case IR::ValueOpcode::BitwiseAnd32: {
+			const auto a = arg(0), b = arg(1);
+			if (a || b) {
+				result = std::min(a.value_or(UINT32_MAX), b.value_or(UINT32_MAX));
+			}
+			break;
+		}
+		case IR::ValueOpcode::BitwiseOr32:
+		case IR::ValueOpcode::BitwiseXor32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = std::bit_ceil(std::max(*a, *b) + 1u) - 1u;
+			}
+			break;
+		case IR::ValueOpcode::SelectU32:
+			if (const auto a = arg(1), b = arg(2); a && b) {
+				result = std::max(*a, *b);
+			}
+			break;
+		case IR::ValueOpcode::Phi: {
+			uint64_t bound = 0;
+			bool     known = inst->NumArgs() != 0;
+			for (size_t index = 0; known && index < inst->NumArgs(); index++) {
+				const auto incoming = arg(index);
+				known               = incoming.has_value();
+				bound               = known ? std::max(bound, *incoming) : bound;
+			}
+			if (known) {
+				result = bound;
+			}
+			break;
+		}
+		default: break;
+	}
+	visiting.pop_back();
+	return result && *result <= UINT32_MAX ? result : std::nullopt;
+}
+
 } // namespace
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
+	// A non-compute stage keeps LDS in a function-scope array of its own, which NVIDIA places in
+	// local memory: at the 8192-dword default that is 32 KB per invocation, several GB across the
+	// GPU. Size it from the addresses the shader can form instead.
+	uint64_t function_lds_bytes     = 0;
+	bool     function_lds_unbounded = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
@@ -265,6 +363,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+					std::vector<const IR::Inst*> visiting;
+					const auto address = UpperBoundU32(inst.Arg(0), program.wave_size, visiting);
+					if (address.has_value()) {
+						const auto& memory = program.memory_info[index];
+						function_lds_bytes = std::max(
+						    function_lds_bytes, *address + std::max(memory.offset, memory.secondary_offset) +
+						                            4u * IR::SharedComponentCount(inst.GetOpcode()));
+					} else {
+						function_lds_unbounded = true;
+					}
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
@@ -277,12 +385,18 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
 					requirements.subgroup_ballot  = true;
 					requirements.subgroup_shuffle = true;
 					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+						requirements.subgroup_local_invocation_id = true;
+					}
+					if (inst.GetOpcode() == IR::ValueOpcode::ReadLane &&
+					    IR::MatchLaneReduction(inst, program.wave_size)) {
+						requirements.subgroup_arithmetic          = true;
 						requirements.subgroup_local_invocation_id = true;
 					}
 					break;
@@ -330,7 +444,117 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 		}
 	}
+	if (requirements.function_lds && !function_lds_unbounded &&
+	    function_lds_bytes < 8192u * sizeof(uint32_t)) {
+		requirements.function_lds_dwords =
+		    static_cast<uint32_t>((function_lds_bytes + sizeof(uint32_t) - 1u) / sizeof(uint32_t));
+	}
 	return requirements;
+}
+
+namespace {
+// The scope of the barriers that keep one guest wave's LDS accesses in order (EmitBlock). The
+// guest's lanes run in lockstep and its LDS accesses complete in program order; host invocations
+// need a barrier. It can be issued wherever the guest wave's control flow is uniform across the
+// barrier's scope, which holds everywhere at block level (divergence is emulated with EXEC):
+// - a single-wave workgroup gets the workgroup scope (on NVIDIA a subgroup-scope barrier did not
+//   make one lane's LDS writes visible to the others, as AnyPS5 found);
+// - otherwise the host subgroup scope, when one host subgroup holds exactly one guest wave;
+// - otherwise none (a barrier that other waves of the scope may not reach could hang).
+// Compute shaders that write LDS only. KYTY_WAVE_LDS_ORDER=0 turns it off.
+uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
+                      uint32_t lane_count) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WAVE_LDS_ORDER");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || program.stage != ShaderType::Compute || workgroup == nullptr) {
+		return 0;
+	}
+	bool writes = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			writes |= access != IR::SharedAccess::None && access != IR::SharedAccess::Read;
+		}
+	}
+	if (!writes) {
+		return 0;
+	}
+	const auto threads = std::max(workgroup->threads_num[0], 1u) *
+	                     std::max(workgroup->threads_num[1], 1u) *
+	                     std::max(workgroup->threads_num[2], 1u);
+	if (threads <= program.wave_size) {
+		return spv::ScopeWorkgroup;
+	}
+	if (lane_count == 2u || (program.wave_size == workgroup->host_subgroup_size &&
+	                         workgroup->host_subgroup_size <= 32u)) {
+		return spv::ScopeSubgroup;
+	}
+	return 0;
+}
+
+std::atomic_bool     g_image_min_lod {false};
+std::atomic_uint32_t g_device_clock_shift {3};
+std::atomic_bool     g_coherent_load_acquire {false};
+std::atomic_bool     g_denorm_flush_f32 {false};
+
+// The guest flushes FP32 denormals on input and output (MODE.FP_DENORM bits 5:4 clear). Pixel and
+// geometry shaders always run with MODE 0xc0 (shader.cpp refuses others).
+bool GuestFlushesF32Denorms(const IR::Program& program, const ShaderStageInputInfo& input_info) {
+	switch (program.stage) {
+		case ShaderType::Compute:
+			return input_info.compute != nullptr && (input_info.compute->float_mode & 0x30u) == 0;
+		case ShaderType::Pixel:
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: return true;
+		default: return false;
+	}
+}
+} // namespace
+
+void SetDenormFlushF32Supported(bool supported) {
+	g_denorm_flush_f32.store(supported, std::memory_order_relaxed);
+}
+
+bool GetDenormFlushF32Supported() {
+	return g_denorm_flush_f32.load(std::memory_order_relaxed);
+}
+
+uint32_t NativeDenormFlushF32Mode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_NATIVE_FTZ");
+		return value == nullptr ? 2u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
+	}();
+	return mode;
+}
+
+void SetCoherentLoadAcquire(bool enabled) {
+	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+bool GetCoherentLoadAcquire() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_ACQUIRE");
+		return value == nullptr ? -1 : (std::strcmp(value, "0") != 0 ? 1 : 0);
+	}();
+	return forced >= 0 ? forced == 1 : g_coherent_load_acquire.load(std::memory_order_relaxed);
+}
+
+void SetDeviceClockShift(uint32_t shift) {
+	g_device_clock_shift.store(shift, std::memory_order_relaxed);
+}
+
+uint32_t GetDeviceClockShift() {
+	return g_device_clock_shift.load(std::memory_order_relaxed);
+}
+
+void SetHostImageFeatures(const HostImageFeatures& features) {
+	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+}
+
+HostImageFeatures GetHostImageFeatures() {
+	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
@@ -349,13 +573,22 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	}
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
-	IR::ValidateProgram(program, true);
+	if (IR::IrValidationEnabled()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	if (program.stage == ShaderType::Mesh) {
+		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
+	}
+	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
+	const auto ftz_mode    = GuestFlushesF32Denorms(program, input_info) ? NativeDenormFlushF32Mode() : 0u;
+	state.denorm_flush_f32 = ftz_mode != 0 && GetDenormFlushF32Supported();
+	state.skip_f32_flush   = state.denorm_flush_f32 || ftz_mode == 2;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

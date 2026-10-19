@@ -7,13 +7,16 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/bufferCachePages.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
-#include <array>
 #include <map>
+#include <memory>
+#include <shared_mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,13 +29,29 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// Diagnostics for KYTY_READMEMORY_STACKS_COMPUTE (bufferCache.cpp).
+void SetReadMemoryInCompute(bool inside);
+
+// Diagnostics (KYTY_CLEAR_CHECK_WRITERS=1): what the GPU thread is translating, recorded with
+// each GPU write (BufferCache::LastGpuWriter). The guest shader address, with these flags.
+inline constexpr uint64_t GpuWriteTagDraw = uint64_t {1} << 63u;
+inline constexpr uint64_t GpuWriteTagFill = uint64_t {1} << 62u;
+inline constexpr uint64_t GpuWriteTagCopy = uint64_t {1} << 61u;
+inline thread_local uint64_t g_gpu_write_tag = 0;
+bool ClearCheckWritersEnabled();
+
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS = 14;
-	static constexpr uint64_t CACHING_PAGESIZE = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES =
-	    (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS  = 14;
+	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	static_assert(CACHING_PAGEBITS == BufferCachePages::kPageBits &&
+	              CACHING_NUMPAGES == BufferCachePages::kNumPages &&
+	              LOWER_ADDRESS_SIZE == BufferCachePages::kLowerAddressSize &&
+	              LibKernel::Memory::kExtendedMemoryBase == BufferCachePages::kExtendedMemoryBase,
+	              "bufferCachePages.h is out of date");
+	static constexpr uint64_t BDA_PAGETABLE_SIZE =
+	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -55,10 +74,23 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// needs_device_address: the caller reads the data through a buffer device address, which
+	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        bool     is_texel_buffer      = false,
+	                                                        BufferId id                   = {},
+	                                                        bool     needs_device_address = false);
+	// The cached buffer over the range, registered and synchronized, never the stream buffer copy
+	// ObtainBuffer may return for a small CPU-written read: for callers that then use the cached
+	// buffer itself (FindBuffer, its device address, its Offset).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferSynced(uint64_t vaddr, uint64_t size);
+	// A written binding of which the shader's stores reach only [written_vaddr, written_vaddr +
+	// written_size): the whole range is synchronized, only that part becomes GPU-written.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferWritten(uint64_t vaddr, uint64_t size,
+	                                                               uint64_t written_vaddr,
+	                                                               uint64_t written_size,
+	                                                               BufferId id = {});
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -69,50 +101,80 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
+	// guest page below 1 TiB, set by shaders through bindings whose writes the host cannot bound.
+	// Its device address, or 0 when it is off or unavailable.
+	[[nodiscard]] vk::DeviceAddress WriteBitmapAddress();
+	// ObtainBuffer for such a written binding: its pages become bitmap-tracked, so a guest read
+	// of a page the GPU did not write needs no download (ReadMemoryStep).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
+	                                                               BufferId id);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Known fills: the value a recorded GPU fill (DMA fill, uniform-fill dispatch, FillKnown)
+	// leaves in a range, until any later GPU write marks bytes of it. Guest memory and the
+	// GPU-written state are not touched: a CPU reader that needs the bytes still downloads them.
+	// TryKnownFill answers only for a range wholly covered by such fills of one value.
+	void               RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool TryKnownFill(uint64_t vaddr, uint64_t size, uint32_t& value);
+	// Drops the known fills a GPU write outside the buffer path overlaps (an image write: render
+	// target, storage image, image copy or clear). Those never reach MarkGpuWritten.
+	void ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	// Color metadata the GPU-side clear check (TextureCache::MaterializeColorClearOnGpu) already
+	// examined, until a GPU write marks bytes of it again (the same rule as known fills): the
+	// check of an unchanged slice finds nothing new, so it is skipped.
+	void               MarkClearChecked(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsClearChecked(uint64_t vaddr, uint64_t size);
+	// KYTY_CLEAR_CHECK_WRITERS=1: the tag (g_gpu_write_tag) and tick of the latest GPU write that
+	// overlaps the range, false when none is recorded.
+	bool LastGpuWriter(uint64_t vaddr, uint64_t size, uint64_t& tag, uint64_t& tick);
+	// Diagnostics: buffer syncs and uploads so far (GPU thread).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> SyncUploads() const;
+	// Fills [vaddr, vaddr + size) on the GPU in the current recording and records the value, without
+	// FillBuffer's texture-cache invalidation. The range must be dword aligned.
+	void FillKnown(uint64_t vaddr, uint64_t size, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
-	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Ranges that may hold CPU data not yet uploaded to their buffers, see
-	// MemoryTracker::TakeCpuModifiedRanges.
-	[[nodiscard]] bool TakeCpuModifiedRanges(std::vector<GuestRange>& ranges) {
-		return m_memory_tracker.TakeCpuModifiedRanges(ranges);
+	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
+	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
+	// memory holds their current value even when their page is protected.
+	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	void                            ProcessFaultBuffer();
+	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
+	// downloading the page: the host copy through the backing store, the GPU copy in the command
+	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
+	// sides and no longer need a download. False when there is nothing to save (the page is not
+	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
+	// no cached buffer covers them); the caller then writes normally.
+	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
+	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
+		return m_fault_manager.UnattributedFaults();
 	}
-	// Thread-safe: adds a range whose buffers must be checked by the next take.
-	void LogCpuModified(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.LogCpuModified(vaddr, size);
-	}
-	void RunGarbageCollector();
+	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
+	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	void                            RunGarbageCollector();
+	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
+	// downloading what the GPU wrote there (drains the GPU).
+	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
 
-	// Diagnostic: a recent GPU write, to name the work that wrote memory the CPU reads back.
-	struct GpuWrite {
-		uint64_t address = 0;
-		uint64_t size    = 0;
-		uint64_t tick    = 0;
-		uint64_t cs      = 0; // Shader addresses bound when the write was recorded
-		uint64_t vs      = 0;
-		uint64_t ps      = 0;
-		uint32_t op      = 0;   // CommandBufferDebugOp of the latest command
-		char     source  = 's'; // 's' shader, 'f' fill, 'c' copy
-	};
-	// The newest recorded write that overlaps the range, and how many recorded writes do.
-	[[nodiscard]] std::pair<const GpuWrite*, uint32_t> FindGpuWrite(uint64_t vaddr,
-	                                                                uint64_t size) const;
+	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
+	inline static thread_local uint64_t s_diag_shader_hash = 0;
 
 private:
 	friend struct BufferCacheTestAccess;
 
-	void RecordGpuWrite(uint64_t vaddr, uint64_t size);
-
+	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -130,6 +192,12 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
+	void MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked = false);
+	// ReadMemoryStep: drops the pages of the readback window the bitmap shows the GPU did not
+	// write. True with wait_tick set when an asynchronous caller must first wait for that tick.
+	bool RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size, bool async,
+	                           uint64_t& wait_tick);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -144,9 +212,17 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
+	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
+	                                      bool from_gpu_thread, bool async);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	template <bool async>
+	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	template <bool async>
+	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+	                          uint64_t total_size);
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
@@ -158,8 +234,71 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// Bytes whose download is recorded but not yet in guest memory.
+	RangeSet                                           m_downloading_ranges;
+	// Every in-flight download's ranges, one entry each: m_downloading_ranges is their union. A
+	// publication removes only its own entries (ISSUES #26: the first of two downloads of one
+	// window cleared the range while the second was in flight; a game thread then took the
+	// page as current, wrote it, and the second publication put older GPU bytes over that).
+	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
+	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
+	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.
+	std::unique_ptr<Buffer>                            m_write_bitmap;
+	bool                                               m_write_bitmap_failed = false;
+	RangeSet                                           m_bitmap_tracked;
+	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
+	uint64_t                                           m_bitmap_dropped_pages = 0;
+	uint64_t                                           m_bitmap_written_pages = 0;
+	// Known fills (RecordKnownFill): begin -> (end, value), non-overlapping. Guarded by
+	// m_dirty_ranges_mutex; MarkGpuWritten drops every one it overlaps.
+	std::map<uint64_t, std::pair<uint64_t, uint32_t>>  m_known_fills;
+	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
+	// MarkClearChecked ranges: begin -> end. Guarded and erased with m_known_fills.
+	std::map<uint64_t, uint64_t>                        m_clear_checked;
+	// SyncBatch (BeginSyncBatch, FlushSyncBatch): uploads recorded together.
+	struct PendingSyncCopy {
+		vk::Buffer source;
+		vk::Buffer destination;
+		uint64_t   destination_size = 0;
+		uint32_t   first_copy       = 0;
+		uint32_t   copy_count       = 0;
+	};
+	// SynchronizeCpuDirtyBuffersInRange scratch: each buffer's dirty span.
+	struct WalkSpan {
+		BufferId id;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::vector<WalkSpan>                               m_walk_spans;
+	bool                                                m_sync_batching = false;
+	uint64_t                                            m_sync_batch_tick = 0;
+	std::vector<PendingSyncCopy>                        m_sync_batch;
+	std::vector<vk::BufferCopy>                         m_sync_batch_copies;
+	void                                                BeginSyncBatch();
+	void                                                FlushSyncBatch();
+	// KYTY_CLEAR_CHECK_WRITERS=1: GPU writes, begin -> (end, tag, tick); newest wins on overlap.
+	struct GpuWriter {
+		uint64_t end  = 0;
+		uint64_t tag  = 0;
+		uint64_t tick = 0;
+	};
+	std::map<uint64_t, GpuWriter>                       m_gpu_writers;
+	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
+	uint64_t                                           m_last_async_download_tick = 0;
+	// Guards changes to both range sets (GPU thread and download completions) against
+	// IsCleanForConcurrentRead; the GPU thread reads them without it.
+	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
+	// Guest reads UploadCopies leaves to the recording thread: staging destination, guest
+	// address, bytes.
+	struct UploadRead {
+		uint8_t* destination;
+		uint64_t address;
+		uint64_t size;
+	};
+	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;
@@ -167,14 +306,15 @@ private:
 	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	// As configured; the ones above come down while memory is short (as in the texture cache).
+	uint64_t m_base_trigger_gc_memory     = 0;
+	uint64_t m_base_critical_gc_memory    = 0;
+	uint64_t m_applied_trigger_gc_memory  = UINT64_MAX; // as in the texture cache
+	uint64_t m_applied_critical_gc_memory = UINT64_MAX;
 	uint64_t m_gc_tick            = 0;
-	// Collector ticks per presented frame, measured at frame boundaries.
-	uint64_t                   m_gc_frame           = 0;
-	uint64_t                   m_gc_frame_tick      = 0;
-	uint64_t                   m_gc_ticks_per_frame = 0;
-	std::array<GpuWrite, 1024> m_gpu_writes {};
-	uint64_t                   m_gpu_write_count  = 0;
-	char                       m_gpu_write_source = 's';
+	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
+	// stretch without presents still ages its entries.
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 };
 
 } // namespace Libs::Graphics

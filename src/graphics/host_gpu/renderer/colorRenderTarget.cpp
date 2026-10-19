@@ -267,7 +267,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
-	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
+	// At most the levels a host image of this extent can have (as ResolveTexture clamps them):
+	// a guest target can declare one more, and drawing into it wrote past the image's memory.
+	const auto host_levels = std::min(
+	    levels, static_cast<uint32_t>(std::bit_width(std::max({width, height, volume ? depth : 1u}))));
+	desc.info.resources    = {host_levels, volume ? 1u : view.image_layers};
 	desc.info.pitch        = pitch;
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
@@ -291,6 +295,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_word1          = rt.clear_word1.word1;
 		desc.info.metadata.clear_register_valid = true;
 	}
 	for (uint32_t level = 0; level < levels; level++) {
@@ -326,7 +331,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 	}
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
-	desc.view_info.base_level  = rt.view.current_mip_level;
+	desc.view_info.base_level  = std::min(rt.view.current_mip_level, host_levels - 1u);
 	desc.view_info.level_count = 1;
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;

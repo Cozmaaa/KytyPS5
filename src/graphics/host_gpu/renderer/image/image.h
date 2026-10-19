@@ -7,8 +7,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <mutex>
 #include <compare>
 #include <limits>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <utility>
@@ -19,6 +21,7 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 class TileManager;
+class CommandRecorder;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -58,8 +61,10 @@ public:
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
+	// Records through the recording thread when given a threaded CommandBuffer::Recorder(); a raw
+	// command buffer converts.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -139,23 +144,41 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
-	ImageInfo                    info;
-	VulkanImage                  backing;
+	ImageInfo        info;
+	VulkanImage      backing;
 	std::vector<CachedImageView> views;
-	ImageUsage                   usage;
-	ImageBinding                 binding;
-	bool                         registered     = false;
-	mutable uint32_t             query_epoch    = 0;
-	uint64_t                     track_addr     = 0;
-	uint64_t                     track_addr_end = 0;
-	ImageId                      depth_id {};
+	ImageUsage       usage;
+	ImageBinding     binding;
+	bool             registered     = false;
+	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
+	// table (TextureCache::on_bindless_unregister) to repoint the slot.
+	bool             bindless_pinned = false;
+	ImageId          self_id {}; // set by TextureCache::InsertImage
+	mutable uint32_t query_epoch    = 0;
+	uint64_t         track_addr     = 0;
+	uint64_t         track_addr_end = 0;
+	ImageId          depth_id {};
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t              tick_accessed_last  = 0;
-	uint64_t              frame_accessed_last = 0;
-	size_t                lru_id              = 0;
-	// Native write order, compared when a one-texel alias shares this image's first element.
+	uint64_t         tick_accessed_last = 0;
+	// Presented frame of the last access: overlapping aliases age by frames as well as by ticks
+	// (TextureCache::ResolveOverlap, KYTY_IMAGE_ALIAS_AGE).
+	uint64_t         frame_accessed_last = 0;
+	uint64_t         frame_guest_dropped = 0; // when the guest last dropped it from its heaps
+	size_t           lru_id             = 0;
+	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
+	bool             alias_owner        = false;
+	// TextureCache's sequence number of the last native write (CommitGpuWrite and copies), to
+	// order the writes of one-texel aliases (TextureCache::OverwritesTexel).
 	uint64_t gpu_write_seq = 0;
+	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
+	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
+	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip
+	// the synchronous GPU readback after the first one -- a real re-clear in a later recording
+	// still gets caught because the tick will have advanced by then.
+	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
+	uint32_t         dcc_clear_checked_first = 0;
+	uint32_t         dcc_clear_checked_count = 0;
 
 private:
 	friend struct ImageTestAccess;
@@ -175,6 +198,25 @@ private:
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 };
+
+// Changes of a bindless-pinned image's state that the per-draw bindless pass checks
+// (RenderExecutor::CommitBindings): its layout, render-target use and registration. A heap is
+// rechecked only when this changed since it was last checked, or for the images resolved since.
+inline std::atomic<uint64_t> g_bindless_state_generation {1};
+// The pinned images whose state changed, for the engine method's per-draw pass (E5), which looks
+// at these and at newly settled images only, instead of every image of a heap.
+struct BindlessStateChanges {
+	std::mutex           mutex;
+	std::vector<ImageId> ids;
+};
+inline BindlessStateChanges g_bindless_state_changes;
+inline void NoteBindlessStateChange(const Image& image) noexcept {
+	if (image.bindless_pinned) {
+		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
+		std::scoped_lock lock {g_bindless_state_changes.mutex};
+		g_bindless_state_changes.ids.push_back(image.self_id);
+	}
+}
 
 namespace ImageOps {
 

@@ -2,8 +2,10 @@
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -17,15 +19,24 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_scheduler(scheduler) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return !m_open;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_scheduler.Threaded()) {
+		// Recording directly: the recording thread must have run everything queued first.
+		return m_scheduler.DrainRecording();
+	}
 	return m_buffer;
+}
+
+CommandRecorder CommandBuffer::Recorder() const {
+	EXIT_IF(IsInvalid());
+	return m_scheduler.Threaded() ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
 }
 
 void CommandBuffer::Begin() {
@@ -42,6 +53,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	if (m_scheduler.Threaded()) {
+		// The recording thread ends it before submitting (CommandScheduler::Submit).
+		return;
+	}
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -58,6 +73,34 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
+		uint64_t shader0 = 0;
+		uint64_t shader1 = 0;
+		if (m_shaders != nullptr) {
+			const auto debug_op = static_cast<CommandBufferDebugOp>(op);
+			if (debug_op == CommandBufferDebugOp::DispatchDirect ||
+			    debug_op == CommandBufferDebugOp::DispatchIndirect) {
+				shader0 = m_shaders->GetCs().cs_regs.data_addr;
+			} else if (debug_op == CommandBufferDebugOp::DrawIndex ||
+			           debug_op == CommandBufferDebugOp::DrawIndexAuto) {
+				const auto& vs = m_shaders->GetVs();
+				shader0        = vs.gs_regs.data_addr != 0 ? vs.gs_regs.data_addr : vs.es_regs.data_addr;
+				shader1        = m_shaders->GetPs().ps_regs.data_addr;
+			}
+		}
+		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
+		                                                 .submit_id = submit_id,
+		                                                 .arg0      = arg0,
+		                                                 .arg1      = arg1,
+		                                                 .arg2      = arg2,
+		                                                 .arg3      = arg3,
+		                                                 .arg4      = arg4,
+		                                                 .shader0   = shader0,
+		                                                 .shader1   = shader1});
+		if (marker != nullptr) {
+			Recorder().setCheckpointNV(marker);
+		}
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
@@ -103,7 +146,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	Recorder().beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -112,7 +155,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }

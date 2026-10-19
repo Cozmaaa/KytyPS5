@@ -144,6 +144,10 @@ bool GpuAssistedValidationEnabled() {
 	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
 }
 
+bool VulkanValidationFatal() {
+	return g_config->vulkan_validation_fatal;
+}
+
 bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }
@@ -166,6 +170,18 @@ bool PlayGoHackEnabled() {
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+bool BindlessImagesEnabled() {
+	return g_config->bindless_images_enabled;
+}
+
+const std::string& GetSkipShaderHashes() {
+	return g_config->skip_shader_hashes;
+}
+
+bool FloatImageAtomicsEnabled() {
+	return g_config->float_image_atomics_enabled;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

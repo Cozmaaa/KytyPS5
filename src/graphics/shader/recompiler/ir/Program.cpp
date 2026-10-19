@@ -1,6 +1,8 @@
 #include "common/assert.h"
+#include "common/config.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -114,14 +116,16 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 
 Program::~Program() {
 	// Planning expressions can refer to block values but outlive block storage in the base class.
-	for (auto& inst: value_storage) {
-		inst.Invalidate();
-	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
-	// its instruction storage so reverse-use links always point to live definitions.
+	// its instruction storage so reverse-use links always point to live definitions. Every
+	// instruction of both goes now, so nobody's use list needs maintaining (removing each use
+	// one by one was quadratic for widely used values).
+	for (auto& inst: value_storage) {
+		inst.DropForDestruction();
+	}
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropForDestruction();
 		}
 	}
 }
@@ -135,6 +139,7 @@ Program& Program::operator=(Program&& other) noexcept {
 }
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
+	auto bda_read_plan = BuildBdaReadPlan(*this); // (before info moves: it reads info.uses_dma)
 	CompiledShaderInfo result {
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
@@ -145,7 +150,10 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .table_mode      = table_mode,
+	    .table_plan      = std::move(table_plan),
 	};
+	result.bda_read_plan = std::move(bda_read_plan);
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
 			result.param_export_mask |= 1u << output.index;
@@ -216,6 +224,22 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+// The IR consistency check: every block, edge and instruction, with hash maps. It only finds bugs
+// in the passes, and ran twice per translation on the GPU thread (2 % of it in the jungle, warm,
+// 2026-10-03). The translation path runs it in debug builds, and in release builds with
+// KYTY_VALIDATE_IR=1; direct calls (the tests) always validate.
+bool IrValidationEnabled() {
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	return true;
+#else
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VALIDATE_IR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+#endif
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
@@ -420,7 +444,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    memory.component_count == 1u || memory.component_count == 2u ||
 				    memory.component_count == 4u || memory.component_count == 8u ||
 				    memory.component_count == 16u;
-				if (memory.data_bits != 32u || memory.data_dwords != 1u || !valid_group_width ||
+				if (memory.formatted || memory.typed || memory.data_bits != 32u ||
+				    memory.data_dwords != 1u || !valid_group_width ||
 				    memory.component_index >= memory.component_count) {
 					return Fail(fmt::format("{} has inconsistent scalar-memory metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
@@ -461,7 +486,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has an invalid memory-info index",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				const auto& memory = program.memory_info[memory_index];
+				const auto& memory        = program.memory_info[memory_index];
 				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
 				                            memory.kind == ResourceKind::IndirectBuffer;
 				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {

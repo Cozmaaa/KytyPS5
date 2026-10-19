@@ -1,5 +1,6 @@
 #include "common/archive.h"
 
+#include "common/cpuAffinity.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -210,6 +211,7 @@ private:
 	}
 
 	void Loop() {
+		PlaceCurrentThread(ThreadClass::Background, "archive reader");
 		for (;;) {
 			Request* request;
 			{

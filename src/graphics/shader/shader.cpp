@@ -21,11 +21,13 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -63,8 +65,17 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	// Draws read the input semantics from this copy, not from the header: the header can share a
+	// page with memory the GPU writes each frame, and reading it per draw faults and drains the
+	// pipeline. Copied before taking the lock, as the read itself can fault.
+	auto mapped = data;
+	if (data.input_semantics != nullptr) {
+		const auto count =
+		    std::min<uint32_t>(data.num_input_semantics, ShaderMappedData::MaxInputSemantics);
+		std::copy_n(data.input_semantics, count, mapped.input_semantics_snapshot.begin());
+	}
 	std::scoped_lock lock(g_shader_map_mutex);
-	(*g_shader_map)[addr] = {data, hash};
+	(*g_shader_map)[addr] = {mapped, hash};
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -531,8 +542,10 @@ static void ShaderGetStaticInputInfoPS(
 	if ((active_inputs & 0x00000004u) != 0) {
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
-	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
-		const auto& semantic = data.input_semantics[i];
+	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num &&
+	                     i < ShaderMappedData::MaxInputSemantics;
+	     i++) {
+		const auto& semantic = data.input_semantics_snapshot[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
@@ -569,12 +582,14 @@ static void ShaderGetStaticInputInfoPS(
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
-	const auto host_subgroup_size         = info.host_subgroup_size;
-	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
-	info                                  = {};
-	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
-	info.host_subgroup_size               = host_subgroup_size;
+	const bool dispatch_thread_dimensions   = info.dispatch_thread_dimensions;
+	const bool dispatch_dimensions_indirect = info.dispatch_dimensions_indirect;
+	const auto host_subgroup_size           = info.host_subgroup_size;
+	const auto workgroup_counts             = std::to_array(info.workgroup_counts);
+	info                                    = {};
+	info.dispatch_thread_dimensions         = dispatch_thread_dimensions;
+	info.dispatch_dimensions_indirect       = dispatch_dimensions_indirect;
+	info.host_subgroup_size                 = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
 	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
@@ -622,7 +637,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       static_cast<uint32_t>(mesh.fast_launch), mesh.passes});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -664,6 +679,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	key.push_back(info.target_uint_mask);
+	key.push_back(info.target_sint_mask);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
@@ -685,6 +702,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	key.push_back(static_cast<uint32_t>(info.dispatch_dimensions_indirect));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
@@ -762,23 +780,67 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices :
-	                      group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	// NGG can export indexed primitives independently of the output vertex count. In particular,
+	// meshlet shaders can emit more triangles than vertices - 2 (the title's forest).
+	const auto primitive_amplification = sh.m_geNggSubgrpCntl & 0x1ffu;
+	// Fast launch (mesh shader mode) takes its primitive capacity from PRIM_AMP_FACTOR as well:
+	// a meshlet usually emits more triangles than vertices.
+	mesh.max_primitives = mesh.fast_launch
+	                          ? std::max(mesh.max_vertices, primitive_amplification)
+	                          : group.primitive_group_size *
+	                                std::max(sh.m_vgtGsMaxVertOut - 2u, primitive_amplification);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
+	const auto explicit_threads = (sh.m_geNggSubgrpCntl >> 9u) & 0x1ffu;
+	const auto output_threads = std::max({mesh.max_vertices, mesh.max_primitives, explicit_threads});
 	mesh.threads_num[0] =
-	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+	    ((output_threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
 }
 
-std::array<ShaderParams, 3>
-PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+// The content hash ShaderMapUserData registered for the code at addr, or 0.
+static uint64_t MappedShaderHash(uint64_t addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) {
+		return 0;
+	}
+	const auto iter = g_shader_map->find(addr);
+	return iter != g_shader_map->end() ? iter->second.hash : 0;
+}
+
+uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
+	return MappedShaderHash(shader_addr);
+}
+
+// Tessellation program pairs the analysis has already rejected, keyed by the registered LS/HS
+// hashes and the tessellation configuration. The analysis is a full decode of both programs;
+// without this a rejected pair is re-analysed on every draw that uses it.
+static std::mutex                   g_rejected_tessellation_mutex;
+static std::unordered_set<uint64_t> g_rejected_tessellation;
+
+static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
+                                       const HW::ShaderRegisters&  sh) {
+	const uint64_t words[4] = {MappedShaderHash(regs.ls_regs.data_addr),
+	                           MappedShaderHash(regs.hs_regs.data_addr), sh.m_vgtLsHsConfig,
+	                           sh.m_vgtTfParam};
+	return XXH3_64bits(words, sizeof(words));
+}
+
+bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 std::array<ShaderVertexInputInfo, 3>& input_info,
+                                 std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
+	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	{
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		if (g_rejected_tessellation.contains(tess_key)) {
+			return false;
+		}
+	}
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
@@ -791,7 +853,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
-	std::array<ShaderParams, 3> params {
+	params = {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
 	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
@@ -823,11 +885,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		g_rejected_tessellation.insert(tess_key);
+		return false;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
-	return params;
+	return true;
 }
 
 ShaderParams PrepareProgram(

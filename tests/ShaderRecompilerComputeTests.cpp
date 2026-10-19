@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -45,6 +46,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -160,6 +162,11 @@ struct BufferCacheTestAccess {
     cache.m_critical_gc_memory = critical;
   }
 
+  // The caches age their entries by presented frames; the tests present them here.
+  static void PresentFrames(BufferCache &cache, uint64_t frames) {
+    cache.m_graphics.presented_frames.fetch_add(frames);
+  }
+
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
@@ -229,6 +236,9 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
+    // A fresh scenario: the per-frame eviction budget starts empty, as at a new frame.
+    cache.m_gc_freed_bytes_frame = 0;
+    cache.m_gc_freed_images_frame = 0;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
@@ -268,6 +278,18 @@ struct TextureCacheTestAccess {
     return result;
   }
 
+  static bool HasCachedRegionQuery(TextureCache &cache, uint64_t address,
+                                   uint64_t size, bool page_overlap) {
+    std::lock_guard lock(cache.m_lock);
+    return std::any_of(
+        cache.m_region_queries.begin(), cache.m_region_queries.end(),
+        [&](const auto &query) {
+          return query.epoch == cache.m_registry_epoch &&
+                 query.address == address && query.size == size &&
+                 query.page_overlap == page_overlap;
+        });
+  }
+
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
     const auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
@@ -296,6 +318,8 @@ struct TextureCacheTestAccess {
         .m_image_page_table[static_cast<size_t>(
             address >> TextureCache::ImagePageTable::kPageBits)]
         .push_back(id);
+    // Edits outside registration drop every cached region query.
+    cache.m_registry_epoch++;
   }
 
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
@@ -303,12 +327,15 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
+    cache.m_registry_epoch++;
     return owners != nullptr && owners->Erase(id);
   }
 
   static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
     std::lock_guard lock(cache.m_lock);
     cache.m_image_query_epoch = epoch;
+    // The next query must walk the page owners instead of reusing a cached result.
+    cache.m_registry_epoch++;
   }
 
   static uint32_t QueryEpoch(TextureCache &cache) {
@@ -1265,6 +1292,64 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// The cached expander must return exactly what InlineShaderFunctions returns, while user data
+// the call does not depend on changes, the target changes, and the callee code changes.
+void CheckShaderFunctionExpansionCache() {
+  constexpr const char *name = "ShaderFunctionExpansionCache";
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t callee_b = 0x10000100ull;
+  std::vector<u32> memory(0x200 / 4, 0xbf810000u);
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    std::copy(words.begin(), words.end(), memory.begin() + (address - callee_a) / 4);
+  };
+  // v_mov_b32 v0, 1; s_setpc_b64 s[4:5]
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 4)});
+  // v_mov_b32 v0, 2; v_mov_b32 v1, 3; s_setpc_b64 s[4:5]
+  store(callee_b, {EncodeVop1(0x01u, 0, InlineU32(2)), EncodeVop1(0x01u, 1, InlineU32(3)),
+                   EncodeSop1(0x20u, 0, 4)});
+  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<uint32_t> words) {
+    if (address < callee_a || address + words.size() * 4 > callee_a + memory.size() * 4) {
+      return false;
+    }
+    std::copy_n(memory.begin() + (address - callee_a) / 4, words.size(), words.begin());
+    return true;
+  };
+  // s_swappc_b64 s[4:5], s[0:1]: the target comes from user data s0/s1.
+  std::vector<u32> code{EncodeSop1(0x21u, 4, 0)};
+  AppendEnd(&code);
+  const uint64_t base = reinterpret_cast<uint64_t>(code.data());
+
+  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+  const auto check = [&](const char *step, std::array<u32, 3> user_data,
+                         bool expect_calls) {
+    std::vector<u32> reference;
+    std::vector<u32> cached;
+    std::string reference_reason;
+    std::string cached_reason;
+    const bool reference_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+        code, base, user_data, read, reference, reference_reason, 64);
+    const bool cached_ok =
+        expander.Expand(code, base, user_data, read, cached, cached_reason, 64);
+    Require(name, step,
+            reference_ok && cached_ok && reference == cached &&
+                reference_reason == cached_reason && (reference.size() > 2) == expect_calls,
+            "the cached expansion differs from InlineShaderFunctions");
+    return cached;
+  };
+  const auto first = check("first expansion", {u32(callee_a), 0, 7}, true);
+  const auto unrelated = check("unrelated user data", {u32(callee_a), 0, 9}, true);
+  Require(name, "unrelated user data", first == unrelated,
+          "a register the call does not use changed the expansion");
+  const auto other = check("other target", {u32(callee_b), 0, 9}, true);
+  Require(name, "other target", other != first, "a new call target reused the old expansion");
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(4))});
+  const auto patched = check("patched callee", {u32(callee_a), 0, 7}, true);
+  Require(name, "patched callee", patched != first,
+          "changed callee code reused the old expansion");
+  check("target again", {u32(callee_b), 0, 7}, true);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 struct BdaMapping {
@@ -2945,13 +3030,14 @@ public:
         const bool gds_waited_once =
             gpu_scheduler.CurrentTick() == gds_tick + 1;
 
+        // An interrupt-only event is queued for its tick and batched a few events deep.
         auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
         Pm4Execution interrupt_execution;
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const bool interrupt_batched =
+            gpu_scheduler.CurrentTick() == interrupt_tick;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -2964,7 +3050,7 @@ public:
         release_mem_submission_counts =
             gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            interrupt_batched &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -2976,8 +3062,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its required readback, retained a redundant GPU "
+              "wait, or split a batchable fence write");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
@@ -4424,6 +4510,7 @@ public:
       cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
                        false);
 
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4442,20 +4529,48 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
                                               &second_before_completion,
                                               sizeof(second_before_completion));
-      Require(name, "normal dirty retention",
-              first_before_completion == first_stale &&
-                  second_before_completion == second_stale &&
-                  cache.IsRegionRegistered(base, allocation_size) &&
-                  cache.IsRegionGpuModified(base + first_offset,
-                                            sizeof(first_value)) &&
-                  cache.IsRegionGpuModified(base + second_offset,
-                                            sizeof(second_value)) &&
+      // An aged dirty Buffer is published and dropped under normal pressure as well: a
+      // retained one keeps owning its pages, and images sharing them are re-sourced from
+      // its stale bytes.
+      Require(name, "normal dirty publication",
+              first_before_completion == first_value &&
+                  second_before_completion == second_value &&
+                  !cache.IsRegionRegistered(base, allocation_size) &&
+                  !cache.IsRegionGpuModified(base + first_offset,
+                                             sizeof(first_value)) &&
+                  !cache.IsRegionGpuModified(base + second_offset,
+                                             sizeof(second_value)) &&
+                  !cache.HasGpuDirtyBytes(base + first_offset,
+                                          sizeof(first_value)) &&
+                  !cache.HasGpuDirtyBytes(base + second_offset,
+                                          sizeof(second_value)) &&
+                  scheduler.CurrentTick() > gc_submission_tick,
+              "normal GC retained or failed to publish an aged dirty Buffer");
+
+      // Re-arm the same dirty state, aged past the critical policy's 80 ticks, for the
+      // publication-ordering check below.
+      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
+                                            sizeof(first_stale));
+      Libs::LibKernel::Memory::WriteBacking(base + second_offset, &second_stale,
+                                            sizeof(second_stale));
+      MarkGpuWrite(base + first_offset, sizeof(first_value));
+      MarkGpuWrite(base + second_offset, sizeof(second_value));
+      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
+                       false);
+      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
+                       false);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      BufferCacheTestAccess::PresentFrames(cache, 8);
+      for (uint32_t tick = 0; tick < 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "re-armed dirty Buffer",
+              cache.IsRegionRegistered(base, allocation_size) &&
                   cache.HasGpuDirtyBytes(base + first_offset,
-                                         sizeof(first_value)) &&
-                  cache.HasGpuDirtyBytes(base + second_offset,
-                                         sizeof(second_value)) &&
-                  scheduler.CurrentTick() == gc_submission_tick,
-              "normal GC retired or synchronized a dirty Buffer");
+                                         sizeof(first_value)),
+              "the re-armed dirty Buffer was reclaimed without pressure");
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto older_publication_tick = scheduler.CurrentTick();
       std::binary_semaphore older_publication_entered{0};
@@ -4518,6 +4633,7 @@ public:
         cache.FillBuffer(address, sizeof(starvation_value), starvation_value,
                          false);
       }
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4528,37 +4644,42 @@ public:
       Require(name, "normal-GC clean candidate",
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
+      const auto starvation_retired =
+          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
+      // Aged dirty owners are published and dropped under normal pressure, at most 32 per
+      // run, so the 33 dirty ones and the clean candidate take two runs; none of them may
+      // be retained, and the clean candidate must not be hidden behind them.
       cache.RunGarbageCollector();
+      cache.RunGarbageCollector();
+      uint32_t starvation_first_backing = 0;
+      uint32_t starvation_last_backing = 0;
+      std::memcpy(&starvation_first_backing, memory + starvation_offset,
+                  sizeof(starvation_first_backing));
+      std::memcpy(&starvation_last_backing,
+                  memory + starvation_offset +
+                      (starvation_count - 1) * starvation_stride,
+                  sizeof(starvation_last_backing));
       Require(
-          name, "normal-GC dirty bypass",
-          cache.IsRegionRegistered(base + starvation_offset,
-                                   sizeof(starvation_value)) &&
-              cache.IsRegionRegistered(
+          name, "normal-GC dirty publication",
+          starvation_first_backing == starvation_value &&
+              starvation_last_backing == starvation_value &&
+              !cache.IsRegionRegistered(base + starvation_offset,
+                                        sizeof(starvation_value)) &&
+              !cache.IsRegionRegistered(
                   base + starvation_offset +
                       (starvation_count - 1) * starvation_stride,
                   sizeof(starvation_value)) &&
               !cache.IsRegionRegistered(base + starvation_clean_offset,
-                                        sizeof(starvation_value)),
-          "old dirty owners hid an eligible clean Buffer from normal GC");
-      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
-      const auto starvation_retired =
-          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
-      Require(name, "critical-GC starvation cleanup",
-              !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
-                  !cache.IsRegionRegistered(
-                      base + starvation_offset +
-                          (starvation_count - 1) * starvation_stride,
-                      sizeof(starvation_value)) &&
-                  !BufferCacheTestAccess::IsBufferAllocated(
-                      cache, starvation_retired),
-              "critical GC did not immediately free the skipped dirty owners");
+              !BufferCacheTestAccess::IsBufferAllocated(cache,
+                                                        starvation_retired),
+          "normal GC retained aged dirty owners or hid the clean Buffer");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
@@ -4571,6 +4692,7 @@ public:
           base + lookup_only_offset, residency_size);
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4700,6 +4822,7 @@ public:
                 "failed to allocate the large dirty native buffer");
         cache.FillBuffer(base + large_offset, large_size, large_value, false);
         const auto large_submission_tick = scheduler.CurrentTick();
+        BufferCacheTestAccess::PresentFrames(cache, 8);
         for (uint32_t tick = 0; tick <= 160; tick++) {
           cache.RunGarbageCollector();
         }
@@ -4761,6 +4884,7 @@ public:
                        grouped_first_value, false);
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4863,6 +4987,7 @@ public:
                       cache, base + sparse_offset + sparse_owner_stride),
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
       }
@@ -4891,6 +5016,7 @@ public:
                                sizeof(disjoint_value), true, false);
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4953,6 +5079,7 @@ public:
                                sizeof(reacquire_value), true, false);
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4997,6 +5124,85 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // PPSA03541: dynamic resolution narrows and widens a depth target at the same pitch and
+  // height. The bound image must never be narrower than the requested render area.
+  void CheckDepthTargetWidthGrowth() {
+    constexpr const char *name = "DepthTargetWidthGrowth";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint32_t pitch = 64;
+    constexpr uint32_t height = 16;
+    constexpr uint64_t surface_size = uint64_t{pitch} * height * sizeof(float);
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "depth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth fixed direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      const auto depth_desc = [&](uint32_t width) {
+        auto desc = MakeLinearDesc(base, surface_size, vk::Format::eD32Sfloat,
+                                   Prospero::BufferFormat::k32Float,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, sizeof(float), 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.pitch = pitch;
+        desc.info.mip_layout[0] = {0, surface_size, pitch, height};
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      auto narrow = depth_desc(48);
+      const auto narrow_id = texture_cache.FindImage(narrow);
+      (void)texture_cache.FindDepthTarget(narrow_id, narrow);
+      auto wide = depth_desc(56);
+      const auto wide_id = texture_cache.FindImage(wide);
+      Require(name, "wider request",
+              wide_id != narrow_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, narrow_id) &&
+                  texture_cache.GetImage(wide_id).info.extent.width == 56 &&
+                  texture_cache.GetImage(wide_id).backing.extent.width == 56,
+              "a wider depth request reused the narrower image");
+      (void)texture_cache.FindDepthTarget(wide_id, wide);
+      auto middle = depth_desc(52);
+      Require(name, "narrower request",
+              texture_cache.FindImage(middle) == wide_id,
+              "a narrower depth request did not reuse the wider image");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "depth direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "depth direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -5265,6 +5471,43 @@ public:
               TextureCacheTestAccess::PageOwnerCount(
                   texture_cache, shared_info.data.address) == 0,
               "the final shared owner remained registered");
+
+      // Registration drops only the cached queries over the image's coarse pages.
+      const auto query_info = MakeOwnershipInfo(base + 0x500100, 0x100);
+      const auto query_cached = [&] {
+        return TextureCacheTestAccess::HasCachedRegionQuery(
+            texture_cache, query_info.data.address, query_info.data.size,
+            false);
+      };
+      const auto query_images = [&] {
+        return TextureCacheTestAccess::FindImages(
+            texture_cache, query_info.data.address, query_info.data.size,
+            false);
+      };
+      Require(name, "cached empty region query",
+              query_images().empty() && query_cached(),
+              "an empty region query was not cached");
+      const auto far_owner = TextureCacheTestAccess::InsertImage(
+          texture_cache, MakeOwnershipInfo(base + 0x900000, 0x100));
+      Require(name, "unrelated registration keeps region query",
+              query_cached() && query_images().empty(),
+              "registering on another coarse page dropped a cached query");
+      const auto same_page_owner = TextureCacheTestAccess::InsertImage(
+          texture_cache, MakeOwnershipInfo(base + 0x5ff000, 0x100));
+      Require(name, "same-page registration drops region query",
+              !query_cached() && query_images().empty(),
+              "registering on the queried coarse page kept a stale query");
+      const auto query_owner =
+          TextureCacheTestAccess::InsertImage(texture_cache, query_info);
+      Require(name, "overlapping registration refreshes region query",
+              IsOnlyImage(query_images(), query_owner),
+              "a cached query missed an image registered over it");
+      TextureCacheTestAccess::DeleteImage(texture_cache, query_owner);
+      Require(name, "unregister refreshes region query",
+              query_images().empty(),
+              "a cached query kept an unregistered image");
+      TextureCacheTestAccess::DeleteImage(texture_cache, same_page_owner);
+      TextureCacheTestAccess::DeleteImage(texture_cache, far_owner);
 
       constexpr uint64_t large_owner_size = 64ull * 1024 * 1024;
       const auto large_info =
@@ -8057,18 +8300,29 @@ public:
                                                 &gc_before_completion[index],
                                                 sizeof(uint32_t));
       }
-      Require(name, "batched image pressure retirement",
+      // Two-phase eviction: the images stay registered until their write-backs have landed
+      // (a draw in between would otherwise recreate them from the stale guest bytes), and
+      // nothing is published before the GPU is done.
+      Require(name, "batched image pressure write-back",
+              std::ranges::all_of(gc_images,
+                                  [&](ImageId image) {
+                                    return TextureCacheTestAccess::Contains(
+                                        texture_cache, image);
+                                  }) &&
+                  scheduler.CurrentTick() == gc_batch_tick &&
+                  gc_before_completion == gc_stale_values,
+              "GC freed an evicted image before its write-back landed, submitted per "
+              "image, or published a readback before GPU completion");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      texture_cache.RunGarbageCollector();
+      Require(name, "batched image retirement after landing",
               std::ranges::none_of(gc_images,
                                    [&](ImageId image) {
                                      return TextureCacheTestAccess::Contains(
                                          texture_cache, image);
-                                   }) &&
-                  scheduler.CurrentTick() == gc_batch_tick &&
-                  gc_before_completion == gc_stale_values,
-              "GC submitted per image or published a readback before GPU "
-              "completion");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
+                                   }),
+              "GC kept an evicted image after its write-back landed");
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
           gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
           false);
@@ -8613,23 +8867,32 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_before_completion,
           sizeof(depth_before_completion));
+      // Two-phase eviction: the depth image stays until its write-back has landed; nothing
+      // is published before the GPU is done.
+      const bool depth_image_pending = TextureCacheTestAccess::Contains(
+          texture_cache, combined_destination_image);
+      Require(
+          name, "depth/stencil deferred pressure write-back",
+          depth_image_pending && scheduler.CurrentTick() == depth_gc_tick &&
+              depth_before_completion == stale_added_stencil_depth,
+          fmt::format(
+              "GC freed depth before its write-back landed, or published early: "
+              "pending={} tick={}/{} depth={}/{}",
+              depth_image_pending, scheduler.CurrentTick(), depth_gc_tick,
+              depth_before_completion, stale_added_stencil_depth)
+              .c_str());
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      texture_cache.RunGarbageCollector();
       const bool depth_image_retired = !TextureCacheTestAccess::Contains(
           texture_cache, combined_destination_image);
       const bool depth_proxy_retired = !texture_cache.FindImageFromRange(
           base + added_stencil_offset, added_stencil_size, false);
-      Require(
-          name, "depth/stencil deferred pressure retirement",
-          depth_image_retired && depth_proxy_retired &&
-              scheduler.CurrentTick() == depth_gc_tick &&
-              depth_before_completion == stale_added_stencil_depth,
-          fmt::format(
-              "GC failed to retire/defer depth: image={} proxy={} tick={}/{} "
-              "depth={}/{}",
-              depth_image_retired, depth_proxy_retired, scheduler.CurrentTick(),
-              depth_gc_tick, depth_before_completion, stale_added_stencil_depth)
-              .c_str());
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
+      Require(name, "depth/stencil retirement after landing",
+              depth_image_retired && depth_proxy_retired,
+              fmt::format("GC kept depth after its write-back landed: image={} proxy={}",
+                          depth_image_retired, depth_proxy_retired)
+                  .c_str());
       float depth_after_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_after_completion,
@@ -8722,13 +8985,18 @@ public:
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
+        // Two-phase eviction: the image stays until its write-back has landed.
         Require(
-            name, "near-capacity deferred retirement",
-            !TextureCacheTestAccess::Contains(texture_cache, image) &&
+            name, "near-capacity deferred write-back",
+            TextureCacheTestAccess::Contains(texture_cache, image) &&
                 scheduler.CurrentTick() == tick,
             "near-capacity readback was rejected or synchronously submitted");
         scheduler.Finish();
         scheduler.DrainPriorityOperations();
+        texture_cache.RunGarbageCollector();
+        Require(name, "near-capacity retirement after landing",
+                !TextureCacheTestAccess::Contains(texture_cache, image),
+                "GC kept the near-capacity image after its write-back landed");
         bool content = true;
         for (const auto offset : sample_offsets) {
           uint32_t value = 0;
@@ -9735,6 +10003,9 @@ public:
       uint32_t mode;
       uint32_t expected_threads;
       bool transfer = false;
+      // The CPU writes the counts: a small CPU-written read, which the buffer cache would
+      // serve from its stream buffer, but the conversion reads them by device address.
+      bool cpu = false;
     };
     constexpr std::array cases{
         DispatchCase{{2, 1, 1}, 0x41u, 8},
@@ -9743,6 +10014,7 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{8, 1, 1}, 0x61u, 8, true, true},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -9823,7 +10095,15 @@ public:
         const auto &test = cases[index];
         const auto args = argument_address(index);
         const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
-        if (test.transfer) {
+        if (test.cpu) {
+          std::memcpy(reinterpret_cast<void *>(args), test.dimensions.data(),
+                      sizeof(test.dimensions));
+          // What the write fault on a tracked page does.
+          Require(name, "CPU argument write",
+                  context.InvalidateMemory(args, sizeof(test.dimensions)) &&
+                      cache.IsRegionCpuModified(args, sizeof(test.dimensions)),
+                  "the CPU-written arguments are not CPU-modified");
+        } else if (test.transfer) {
           for (u32 i = 0; i < 3; i++) {
             auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
             buffer->Fill(offset, 4, test.dimensions[i]);
@@ -9840,8 +10120,9 @@ public:
         }
         std::array<u32, 3> stale{};
         Require(name, "GPU-only argument write",
-                LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
-                    stale == std::array<u32, 3>{},
+                test.cpu ||
+                    (LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                     stale == std::array<u32, 3>{}),
                 "argument publication changed the CPU backing before indirect dispatch");
         const auto first_owner = BufferCacheTestAccess::PageOwner(cache, args);
         const auto second_owner = BufferCacheTestAccess::PageOwner(cache, args + 8u);
@@ -9870,9 +10151,10 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
+        // Thread-count arguments are converted on the GPU too, never read back.
+        Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                "indirect arguments caused a host submission or readback");
         if (test.mode == 0x41u) {
-          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
-                  "workgroup-count arguments caused a host submission or readback");
           if (!test.transfer) {
             const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
             Require(name, "argument/output owner merge",
@@ -15244,6 +15526,14 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
+    // Shader data carries each storage buffer's bound length in dwords, as
+    // RenderExecutor::RebindBuffers does; shaders bound buffer accesses with it.
+    for (u32 i = 0; i < buffer_infos.size(); i++) {
+      const auto slot = layout.BufferLengthDword() + i;
+      if (slot < shader_data.size()) {
+        shader_data[slot] = static_cast<u32>(buffer_infos[i].range / sizeof(u32));
+      }
+    }
     if (const auto *flattened = Binding(Kind::FlattenedSrt);
         flattened != nullptr) {
       flattened_buffer =
@@ -15756,6 +16046,29 @@ public:
       }
 #endif
       cmd.setDepthBiasEnable(false);
+      if (PipelineDynamicRasterStateEnabled()) {
+        // As SetGraphicsDynamicParams: the cull and front-face registers are dynamic state.
+        const auto &mode = registers.GetModeControl();
+        const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+        vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+        if (!rect_list && mode.cull_back) {
+          cull_mode |= vk::CullModeFlagBits::eBack;
+        }
+        if (!rect_list && mode.cull_front) {
+          cull_mode |= vk::CullModeFlagBits::eFront;
+        }
+        cmd.setCullMode(cull_mode);
+        cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+                                   : vk::FrontFace::eCounterClockwise);
+#if !defined(__APPLE__)
+        const bool bounds_test = depth.depth_bounds_test_enable &&
+                                 rendering.depth_stencil_attachment.has_depth;
+        cmd.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
+        if (bounds_test) {
+          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+        }
+#endif
+      }
       cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
         const auto set_stencil = [&](vk::StencilFaceFlagBits face,
@@ -18110,6 +18423,9 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
+    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
+    ShaderRecompiler::Spirv::SetHostImageFeatures(
+        {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
@@ -21960,6 +22276,34 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop2SdwaOrByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0xaabbccddu);
+  // Captured: v_or_b32_sdwa v0, v0, v1 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE
+  // src0_sel:BYTE_0 src1_sel:BYTE_2 (0x380002f9 0x02001300).
+  code.push_back(EncodeVop2(0x1c, 0, 249, 1));
+  code.push_back(EncodeVop2Sdwa(0, 3, 2, 0, 2));
+  AppendStoreVgpr(&code, 0, 0);
+  // Every byte destination: (byte 0 of v2) | (byte 1 of v1), the other bytes preserved.
+  AppendVMovLiteral(&code, 2, 0x000000f0u);
+  for (u32 sel = 0; sel < 4; sel++) {
+    AppendVMovLiteral(&code, 10 + sel, 0xa1b2c3d4u);
+    code.push_back(EncodeVop2(0x1c, 10 + sel, 249, 1));
+    code.push_back(EncodeVop2Sdwa(2, sel, 2, 0, 1));
+    AppendStoreVgpr(&code, 10 + sel, 1 + sel);
+  }
+  AppendEnd(&code);
+
+  return {"Vop2SdwaOrByteDestinations",
+          code,
+          {},
+          {0xff223344u, 0xa1b2c3fcu, 0xa1b2fcd4u, 0xa1fcc3d4u, 0xfcb2c3d4u},
+          {O::V_MOV_B32, O::V_OR_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop3CvtPkI16I32Captured() {
   using O = ShaderOpcode;
 
@@ -25763,6 +26107,46 @@ TestCase VectorVop3CompareEqU64OnGpu() {
   return test;
 }
 
+TestCase VectorVop3CompareEqF64OnGpu() {
+  using O = ShaderOpcode;
+
+  struct Case {
+    u32 lo0, hi0, lo1, hi1;
+    u32 src0, src1; // 100: s[100:101], 102: s[102:103], 128: inline 0, 242: inline 1.0
+  };
+  constexpr Case cases[] = {
+      {0, 0x00000000u, 0, 0, 128, 100},           // captured: 0 == +0.0
+      {0, 0x80000000u, 0, 0, 128, 100},           // 0 == -0.0
+      {0, 0x3ff00000u, 0, 0, 128, 100},           // 0 == 1.0
+      // NaN == NaN (false on RDNA2) is left out: upstream translates V_CMP_EQ_F64 as OpFOrdEqual
+      // on f64, which the RTX 5090 driver folds to true for NaN (DEBUGGING.md, 2026-10-02 rebase).
+      {0, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // 1.0 == 1.0
+      {0, 0x3ff00000u, 0, 0, 242, 100},           // inline 1.0 is the f64 1.0
+      {1, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // low dwords differ
+  };
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+  u32 index = 0;
+  for (const auto &c : cases) {
+    AppendSMovLiteral(&code, 100, c.lo0);
+    AppendSMovLiteral(&code, 101, c.hi0);
+    AppendSMovLiteral(&code, 102, c.lo1);
+    AppendSMovLiteral(&code, 103, c.hi1);
+    code.push_back(0xd422006au); // v_cmp_eq_f64 vcc_lo, src0, src1
+    code.push_back(c.src0 | (c.src1 << 9u));
+    code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+    AppendStoreVgpr(&code, 2, index++);
+  }
+  AppendEnd(&code);
+
+  return {"VectorVop3CompareEqF64OnGpu",
+          code,
+          {},
+          {1, 1, 0, 1, 1, 0},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_EQ_F64, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase VectorVop3CompareNeU64OnGpu() {
   using O = ShaderOpcode;
 
@@ -27295,14 +27679,14 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+TestCase ScalarMemRealtimeReadsDeviceClock() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeReadsDeviceClock", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
@@ -27313,11 +27697,16 @@ TestCase ScalarMemRealtimeCapturedPlaceholder() {
   code.insert(code.end(), {0xf4940300u, 0xfa000000u});
   AppendStoreSgprPair(&code, 12, 2);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemRealtimeReadsDeviceClock",
+                code,
+                {},
+                {},
+                {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  // The instruction reads the device clock, so its values are not deterministic: check the
+  // emitted clock read instead of the stored words.
+  test.compile_only = true;
+  test.required_spirv = {"OpReadClockKHR"};
+  return test;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -27863,6 +28252,10 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
               : xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                     : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
+  // v40 = lane index (0 in lane 0), from v_mbcnt_lo_u32_b32 over v41 = ~0u, v42 = 0.
+  AppendVMovLiteral(&test.code, 41, 0xffffffffu);
+  test.code.push_back(EncodeVop1(0x01, 42, InlineU32(0)));
+  test.code.push_back(EncodeVop2(0x23, 40, Vgpr(41), 42));
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
     const u32 data_offset = 4096 + i * 128;
@@ -27879,6 +28272,11 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
     const u32 selected = static_cast<u32>(std::size(cases)) - 1 - i;
     test.initial[64 + i] = selected;
     AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    // Offset the selector address by the lane index: lane 0 reads the same entry, but the
+    // load is no longer a uniform read the host could evaluate (IsUniformBufferRead), so
+    // the descriptor stays GPU-selected.
+    test.code.push_back(EncodeVop2(0x1a, 43, InlineU32(2), 40));
+    test.code.push_back(EncodeVop2(0x25, 30, Vgpr(43), 30));
     AppendBufferLoadDword(&test.code, 0, 30);
     test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
     test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
@@ -32823,6 +33221,13 @@ TestCase ImageGatherExplicitLod() {
   }
   AppendEnd(&code);
 
+  // Mip 0 is all 1.0; mip 1 holds a distinct red value per texel.
+  auto mip1 = MakeRgbaImage(2, 2);
+  SetRgbaPixel(&mip1, 2, 0, 0, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 0, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 0, 1, 0x40800000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 1, 0x40a00000u, 0, 0, 0);
+
   TestCase test;
   test.name = "ImageGatherExplicitLod";
   test.code = std::move(code);
@@ -33020,8 +33425,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // +1 X texel offset, a full 32-bit dword even with A16.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -33031,8 +33435,11 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The coordinates select texel (2,1); the offset moves the read to texel (3,1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 2, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -33042,7 +33449,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  // The offset written under the result's EXEC is the literal: a ConstOffset.
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
   return test;
 }
@@ -35077,6 +35485,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop2SdwaMulI24Destinations(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
+  AddCase(Vop2SdwaOrByteDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
@@ -35175,6 +35584,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
+  AddCase(VectorVop3CompareEqF64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
@@ -35214,7 +35624,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  AddCase(ScalarMemRealtimeReadsDeviceClock);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -35841,9 +36251,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
@@ -40485,9 +40895,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
     return 0;
   }
+  CheckShaderFunctionExpansionCache();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
@@ -41132,6 +41543,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-width-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthTargetWidthGrowth();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -41343,6 +41759,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckDepthTargetWidthGrowth();
 #endif
   } else {
     skipped_device_checks = true;

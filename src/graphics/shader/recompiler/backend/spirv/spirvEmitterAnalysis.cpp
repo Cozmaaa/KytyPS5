@@ -136,8 +136,8 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
-	const auto  scalar_type =
-	    image.atomic64 ? TypeU64(state) : ImageScalarType(state, image.numeric_class);
+	const auto scalar_type = image.atomic64 ? TypeScalarU64(state)
+	                                        : ImageScalarType(state, image.numeric_class);
 	return state.builder.Type(spv::OpTypeImage, scalar_type,
 	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
 	                          info.multisampled, sampled, format);
@@ -154,6 +154,23 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	if (image_resource.bindless) {
+		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+		const auto type     = ImageType(state, image_resource);
+		const auto variable = state.bindless_image_variables.find(type);
+		EXIT_IF(variable == state.bindless_image_variables.end() || state.bindless_slot == 0);
+		const auto pointer_type =
+		    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable->second,
+		                          state.bindless_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto image = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, image, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+		return image;
+	}
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, ImageType(state, state.program.info.images.at(resource)),
@@ -162,11 +179,22 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 }
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
 	const auto pointer_type =
 	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
+	if (state.program.info.samplers.at(sampler).bindless) {
+		EXIT_IF(state.bindless_sampler_variable == 0 || state.bindless_sampler_slot == 0);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+		                          state.bindless_sampler_variable, state.bindless_sampler_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto sampler_id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, sampler_id, spv::DecorationNonUniform);
+		return sampler_id;
+	}
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto pointer = DescriptorElementPointer(
 	    state, pointer_type, state.sampler_variable, ConstantU32(state, array_index),
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
@@ -188,6 +216,11 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+	}
+	// A bindless sampler is loaded NonUniform; the sampled image built from it is too.
+	const bool bindless_sampler = std::ranges::any_of(
+	    state.program.info.samplers, [](const IR::SamplerResource& sampler) { return sampler.bindless; });
+	if (array_index != 0u || image_resource.bindless || bindless_sampler) {
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;

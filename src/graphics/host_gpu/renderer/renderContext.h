@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -39,26 +40,42 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&    GetMutex() { return m_mutex; }
-	CommandScheduler& GetCommandScheduler() { return m_command_scheduler; }
-	PipelineCache&    GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&   GetDescriptorHeap() { return m_descriptor_heap; }
-	SamplerCache&     GetSamplerCache() { return m_sampler_cache; }
-	BufferCache&      GetBufferCache() { return m_buffer_cache; }
-	TextureCache&     GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&   GetRenderExecutor() { return m_render_executor; }
+	Common::Mutex&      GetMutex() { return m_mutex; }
+	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
+	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
+	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
+	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
+	BufferCache&        GetBufferCache() { return m_buffer_cache; }
+	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
+	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
+	// but none of them is GPU-written, so guest memory already holds their value.
+	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+	                                     uint64_t size) const noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// The host protection of the range was replaced behind the page tracker
+	// (PageManager::ResyncHostProtection): the watched pages get the tracker's protection back.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
 	void               PrepareBda();
+	// Only the ranges a draw's or dispatch's BDA loads can read (IR::EvaluateBdaReadPlan): their
+	// CPU-dirty buffers are synchronized. False when it cannot (PrepareBda then walks them all).
+	bool               PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void TriggerInterrupt(int event_id, uint32_t context_id);
+	// An end-of-pipe interrupt, after the label writes queued before it (GuestGpu::
+	// DeliverInterruptAfterLabels). Priority thread.
+	void TriggerInterruptAfterLabels(int event_id, uint32_t context_id);
 
 private:
 	struct InterruptEqRegistration {
@@ -76,13 +93,22 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	BindlessTable             m_bindless_table;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
-	VideoOut::VideoOutDriver* m_video_out             = nullptr;
+	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
-	bool                      m_bda_logged            = false;
-	std::vector<GuestRange>   m_bda_ranges;
+	bool                      m_bda_logged = false;
+	uint64_t                  m_bda_synced_epoch      = 0;
+	uint64_t                  m_bda_synced_submission = 0;
+	uint64_t                  m_bda_walk_enqueued     = 0; // g_guest_enqueued_seq when the last walk started
+	uint64_t                  m_bda_walk_gpu_dirty    = 0; // g_gpu_thread_dirty_seq then
+	uint64_t                  m_bda_walk_wait         = 0; // g_gpu_wait_seq then
+	uint64_t                  m_bda_plan_walk_frame   = UINT64_MAX; // read plans: the frame of the last full walk
+	uint64_t                  m_bda_walk_newer        = 0; // diagnostics: walks for a newer submission
+	uint64_t                  m_bda_walk_gpu_made     = 0; //   and for GPU-thread writes
+	uint64_t                  m_bda_walk_gpu_only     = 0; //   GPU-thread ranges synced without a walk
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

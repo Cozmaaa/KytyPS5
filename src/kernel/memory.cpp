@@ -105,6 +105,33 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
 
+// KYTY_REMAP_TRACKER_PROTECTION=0 turns it off: after a range's host protection was replaced
+// behind the page tracker (the neighbours of a partly unmapped Windows view mapped again with the
+// view's access, views an unmap rolled back, a guest mprotect that allows writes), its watched
+// pages get the tracker's protection back. Without it CPU writes to still-tracked buffers there
+// stopped faulting and the GPU kept using stale bytes. From Jetsku d0111331 (chenxiao07
+// 3f3825158 / e6dfd8e6b).
+static bool RemapTrackerProtectionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_REMAP_TRACKER_PROTECTION");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
+static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !RemapTrackerProtectionEnabled()) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("Remap protection: resync 0x%016" PRIx64 " size 0x%" PRIx64 " (first 8 logged)\n", vaddr,
+		     size);
+	}
+	GetGpuResources().ResyncHostProtection(vaddr, size);
+}
+
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
 	EXIT_IF(mode == nullptr);
 	EXIT_IF(gpu_mode == nullptr);
@@ -231,6 +258,8 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -261,6 +290,8 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -290,6 +321,8 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -303,6 +336,8 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -349,6 +384,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -361,6 +397,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -421,11 +458,45 @@ public:
 		return false;
 	}
 
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
+
+	// Bumped only by the changes that can change which bytes are committed (add, remove,
+	// replace, release); protection, name and memory type changes leave it.
+	[[nodiscard]] uint64_t CoverageGeneration() const noexcept {
+		return m_coverage_generation.load(std::memory_order_acquire);
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
+		}
+		// Committed bytes as merged spans, rebuilt after coverage changed: a heap-wide descriptor
+		// spans thousands of mappings, and while the game streams (it maps memory hundreds of
+		// times a second) the per-thread answers of TryClampRangeSize keep missing, so the walk
+		// below ran under the lock at ~4 us a call (the helicopter cut, 2026-10-09).
+		// KYTY_CLAMP_SPANS=0 walks the ranges as before.
+		static const bool spans = [] {
+			const char* value = std::getenv("KYTY_CLAMP_SPANS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (spans) {
+			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
+			if (m_spans_generation != generation) {
+				RebuildSpansUnlocked();
+				m_spans_generation = generation;
+			}
+			auto span = std::upper_bound(
+			    m_spans.begin(), m_spans.end(), virtual_addr,
+			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
+			if (span == m_spans.begin()) {
+				return 0;
+			}
+			--span;
+			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
 		}
 
 		auto vma = FindContaining(virtual_addr);
@@ -457,6 +528,26 @@ public:
 private:
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
+	}
+
+	// Maximal runs of adjacent committed ranges, as ClampRangeSize's walk joins them.
+	struct Span {
+		uint64_t start = 0;
+		uint64_t end   = 0;
+	};
+	void RebuildSpansUnlocked() {
+		m_spans.clear();
+		for (const auto& [key, r]: m_ranges) {
+			if (!IsCommittedRangeType(r.type) || r.size == 0) {
+				continue;
+			}
+			const auto end = End(r.start, r.size);
+			if (!m_spans.empty() && m_spans.back().end == r.start) {
+				m_spans.back().end = end;
+			} else {
+				m_spans.push_back({r.start, end});
+			}
+		}
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -629,6 +720,13 @@ private:
 	Common::Mutex m_mutex;
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
+	// Bumped by every change of the ranges.
+	std::atomic<uint64_t> m_generation {1};
+	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
+	// per-thread answers and m_spans are valid while it is unchanged.
+	std::atomic<uint64_t> m_coverage_generation {1};
+	std::vector<Span>     m_spans;
+	uint64_t              m_spans_generation = 0;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -871,19 +969,111 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+static thread_local bool t_gpu_read_delegate = false;
+
+bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (t_gpu_read_delegate) {
+		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
+	}
+	if (!Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
+void SetGpuReadDelegate(bool delegate) {
+	t_gpu_read_delegate = delegate;
+}
+
+// Whether [vaddr, vaddr + size) may hold GPU-written bytes, for the GPU thread or its delegate
+// (true for any other thread: it cannot ask).
+static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (t_gpu_read_delegate) {
+		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
+	}
+	return !Graphics::GuestGpu::IsGpuThread() ||
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
+uint64_t CleanBackingGeneration() {
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr) {
+		return 0;
+	}
+	// Both only grow: their sum changes whenever either does.
+	return g_guest_address_space->BackingMapsGeneration() + g_virtual_ranges->CoverageGeneration();
+}
+
+const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || MaybeGpuDirtyForClean(vaddr, size)) {
+		return nullptr;
+	}
+	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return !MaybeGpuDirtyForClean(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&
+	       TryReadBacking(vaddr, data, size);
+}
+
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
+	// Every buffer of every draw asks; a heap-wide descriptor spans thousands of mappings, each
+	// walked under the lock (3.8 % of the GPU thread in the jungle, 2026-10-03). The answer stays
+	// valid until the ranges change, so each thread remembers its recent ones.
+	struct Answer {
+		uint64_t generation = 0;
+		uint64_t vaddr      = 0;
+		uint64_t size       = 0;
+		uint64_t clamped    = 0;
+	};
+	// KYTY_CLAMP_CACHE=0 walks the ranges every time, as before.
+	static const bool cached = [] {
+		const char* value = std::getenv("KYTY_CLAMP_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	thread_local std::array<Answer, 64> answers {};
+	const auto generation = g_virtual_ranges->CoverageGeneration();
+	auto&      answer     = answers[((vaddr >> 12u) ^ (size >> 12u) ^ size) & 63u];
+	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
+		return answer.clamped;
+	}
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	answer                  = {generation, vaddr, size, clamped_size};
+	if (clamped_size != 0 && clamped_size != size) {
+		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " to 0x%016" PRIx64 "\n",
+		     vaddr, size, clamped_size);
+	}
+	return clamped_size;
+}
+
+bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
+	// No guest memory map (unit tests that drive the libraries on host memory): nothing to check.
+	if (g_virtual_ranges == nullptr) {
+		return true;
+	}
+
+	return size == 0 || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
 		     vaddr, size);
-	}
-	if (clamped_size != size) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
 	}
 	return clamped_size;
 }
@@ -3796,7 +3986,8 @@ static std::vector<VirtualRanges::Range> RequireGuestRuntimeMemory(uint64_t vadd
 
 static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
                                            VirtualMemory::Mode mode, const char* name,
-                                           VirtualRangeType type, bool fixed) {
+                                           VirtualRangeType type, bool fixed,
+                                           uint64_t code_offset = 0, uint64_t code_size = 0) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	constexpr uint64_t GuestPageSize = 0x4000;
@@ -3811,7 +4002,8 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	UnmapGpuRange(vaddr, mapped_size);
-	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
+	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode,
+	                                   code_size != 0 ? vaddr + code_offset : 0, code_size)) {
 		return 0;
 	}
 	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
@@ -3823,8 +4015,9 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 }
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
-                               const char* name) {
-	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+                               const char* name, uint64_t code_offset, uint64_t code_size) {
+	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false,
+	                                  code_offset, code_size);
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -3953,6 +4146,11 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	// A writable guest protection replaced the tracker's on watched pages: their CPU writes
+	// would stop faulting.
+	if ((prot & PROT_CPU_WRITE) != 0) {
+		ResyncGpuRangeProtection(aligned_addr, aligned_len);
+	}
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

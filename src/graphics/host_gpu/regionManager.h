@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <utility>
+#include <vector>
 #include <mutex>
 #include <utility>
 
@@ -63,6 +65,46 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Bumped whenever pages become CPU-dirty anywhere (a write fault, an untrack, an
+// invalidation). A consumer that must see every CPU write, such as the pre-dispatch sync of
+// all buffers for global-memory shaders, can skip its walk while this has not moved.
+inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
+
+// Bumped by the GPU thread when it starts a guest submission (its first slice).
+inline std::atomic<uint64_t> g_guest_submission_seq {1};
+
+// Bumped by the guest thread that submits, as it queues a submission (GuestGpu::Enqueue), which
+// stamps the submission with it. Every CPU write a submission may see was made before its stamp.
+inline std::atomic<uint64_t> g_guest_enqueued_seq {0};
+// The stamp of the submission the GPU thread runs now (GPU thread only).
+inline uint64_t g_processing_enqueued_seq = 0;
+// Bumped by the GPU thread at each WAIT_REG_MEM: the game writes data after queuing the command
+// buffer that reads it and lets the GPU past such a wait with a label, so its writes before the
+// label become visible there, not at the submission (UFC 5's skinned fighters and crowd).
+inline uint64_t g_gpu_wait_seq = 0;
+// Set on the GPU thread. CPU-dirty pages and buffer registrations it makes itself (command
+// processor copies and fills, new buffers) bump g_gpu_thread_dirty_seq: no submission stamp
+// covers them.
+inline thread_local bool g_tracker_on_gpu_thread = false;
+inline uint64_t          g_gpu_thread_dirty_seq  = 0;
+// The ranges behind g_gpu_thread_dirty_seq since RenderContext::PrepareBda last took them (GPU
+// thread only); past GpuThreadDirtyCapacity the list is dropped and the next preparation walks.
+inline constexpr size_t                            GpuThreadDirtyCapacity = 4096;
+inline std::vector<std::pair<uint64_t, uint64_t>> g_gpu_thread_dirty_ranges;
+inline bool                                        g_gpu_thread_dirty_overflow = false;
+inline void NoteGpuThreadDirty(uint64_t vaddr, uint64_t size) {
+	++g_gpu_thread_dirty_seq;
+	if (g_gpu_thread_dirty_overflow) {
+		return;
+	}
+	if (g_gpu_thread_dirty_ranges.size() >= GpuThreadDirtyCapacity) {
+		g_gpu_thread_dirty_overflow = true;
+		g_gpu_thread_dirty_ranges.clear();
+		return;
+	}
+	g_gpu_thread_dirty_ranges.emplace_back(vaddr, size);
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -78,6 +120,14 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+
+	// Lock-free "any page in this region may be dirty" summaries. A binding that spans a
+	// whole heap covers hundreds of regions; without these every draw locks and walks each
+	// one. False is exact (set only after a walk saw no bits); true is conservative.
+	template <DirtySource source>
+	[[nodiscard]] bool MaybeModified() const noexcept {
+		return GetSummary<source>().load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -100,8 +150,18 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			StoreSummary<source>(true);
+			if constexpr (source == DirtySource::Cpu) {
+				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				if (g_tracker_on_gpu_thread) {
+					NoteGpuThreadDirty(vaddr, size);
+				}
+			}
 		} else {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				StoreSummary<source>(false);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -120,6 +180,9 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				StoreSummary<source>(false);
+			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -131,9 +194,32 @@ public:
 		}
 	}
 
+	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
+	// Set before the region is published.
+	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
+		m_cpu_summary_word = word;
+		m_cpu_summary_bit  = bit;
+	}
+
 	TrackingSpinLock lock;
 
 private:
+	// Every summary change goes through here; the CPU one is mirrored in the tracker's bitmap at
+	// the same point, before any page protection changes.
+	template <DirtySource source>
+	void StoreSummary(bool value) {
+		GetSummary<source>().store(value, std::memory_order_release);
+		if constexpr (source == DirtySource::Cpu) {
+			if (m_cpu_summary_word != nullptr) {
+				if (value) {
+					m_cpu_summary_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
+				} else {
+					m_cpu_summary_word->fetch_and(~m_cpu_summary_bit, std::memory_order_acq_rel);
+				}
+			}
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -164,6 +250,24 @@ private:
 		}
 	}
 
+	template <DirtySource source>
+	std::atomic<bool>& GetSummary() {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
+	template <DirtySource source>
+	const std::atomic<bool>& GetSummary() const {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
 		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
@@ -178,6 +282,11 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
+	std::atomic<bool> m_cpu_maybe_dirty {true};
+	std::atomic<bool> m_gpu_maybe_dirty {false};
+	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
+	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

@@ -12,8 +12,13 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <functional>
 #include <map>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -26,6 +31,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class Buffer;
 class BufferCache;
+class ColorClearCheck;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
@@ -33,6 +39,11 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Called before a bindless-pinned image is unregistered.
+	std::function<void(ImageId)> on_bindless_unregister;
+	// Called right before an image is destroyed; true keeps it one more GPU tick (a bindless slot
+	// still held one of its views and was repointed).
+	std::function<bool(const Image&)> on_image_release;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -74,9 +85,26 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
-	// Called once per presented frame, from the presentation thread.
-	void                   AdvanceFrame() { m_frame.fetch_add(1, std::memory_order_relaxed); }
-	[[nodiscard]] uint64_t CurrentFrame() const { return m_frame.load(std::memory_order_relaxed); }
+	// The guest no longer refers to this bindless image from any heap entry (it replaced or
+	// cleared them): free it once no draw has used it for a few frames (engine method).
+	void ReleaseDroppedByGuest(ImageId id);
+	// Bindless images no draw sampled during the last usage probe (BindlessTable::
+	// CollectUnusedImages). They stay pinned, but under memory pressure the collector may free
+	// them like any other image; a key that samples one again asks for it anew. Replaces the
+	// previous set.
+	void SetBindlessEvictable(std::span<const ImageId> ids);
+	// Whether the cache's images are above the collector's pressure threshold.
+	// All images, pinned ones included, against the bound: eager settling pauses on it. Settling
+	// ahead while the collector freed other images under the bound lost the device at ~57 s into
+	// a new game, every time (2026-10-07, ISSUES #17); the collector's own thresholds use
+	// CollectableMemory.
+	[[nodiscard]] bool UnderPressure() const noexcept {
+		return m_total_used_memory >= m_pressure_gc_memory;
+	}
+	// Image bytes the collector may free: all but the bindless-pinned ones (refreshed once a frame).
+	[[nodiscard]] uint64_t CollectableMemory() const noexcept {
+		return m_total_used_memory - std::min(m_total_used_memory, m_pinned_bytes);
+	}
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -102,9 +130,9 @@ private:
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -121,6 +149,7 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	void                      ReleaseImage(ImageId id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -138,20 +167,29 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// Drops cached FindImagesInRegion results that an image registered or unregistered over
+	// this range can change.
+	void                        InvalidateRegionQueries(uint64_t address, uint64_t size);
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
-	void InitializeImage(ImageId id);
-	[[nodiscard]] TextureTransfer BuildTextureTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
-	[[nodiscard]] ImageDownload   BuildDownload(const Image& image) const;
-	void                          UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
+	// The check of MaterializeColorClear recorded on the GPU (ColorClearCheck), for GPU-written
+	// metadata. False: not possible here; the caller checks on the CPU.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint64_t address,
+	                                              uint64_t slice_size, uint32_t first,
+	                                              uint32_t image_first, uint32_t count);
+	void                        InitializeImage(ImageId id);
+	[[nodiscard]] TextureTransfer
+	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, ImageDownload transfer);
+	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -159,14 +197,11 @@ private:
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
-	void                  CopyImage(ImageId destination, ImageId source);
+	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
+	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
-
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	// Caller holds m_lock. A one-texel image shares its guest bytes with the first element of
 	// every same-base image, but native images keep separate copies.
@@ -175,8 +210,14 @@ private:
 	void                      SettleTexelAlias(ImageId id);
 	void                      ClearOverwrittenTexels(ImageId writer_id);
 	void ClearTexelAlias(ImageId id, const Image* writer, std::string_view reason);
-	// Frees an image whose native writes may not have reached guest memory.
-	void DropImage(ImageId id, const char* reason);
+
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// evicting: the collector writes the image back before freeing it; the write is dropped if
+	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
+	// `landed`, when given, is set once the write-back has reached guest memory (or was dropped
+	// because the guest wrote the bytes first): an evicted image is freed only then.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false,
+	                                       std::shared_ptr<std::atomic<bool>>* landed = nullptr);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -186,30 +227,89 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	uint64_t                                          m_gpu_write_seq = 0;
+	uint32_t                                          m_texel_logs    = 0;
+	std::unordered_set<std::string>                   m_texel_log_seen;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::unique_ptr<ColorClearCheck>                  m_clear_check;
+	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t              m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
-	uint64_t              m_gc_tick            = 0;
-	std::atomic<uint64_t> m_frame {0};
-	uint64_t              m_gpu_write_seq = 0;
-	// PPSA03541 diagnostics: texel clears, and reads of images whose GPU data was dropped.
-	struct DroppedImage {
-		uint64_t    tick   = 0;
-		const char* reason = "";
-		uint32_t    reads  = 0;
+	// The thresholds as configured; the ones above come down from them while memory is short
+	// (GraphicContext::MemoryShortfall: device use past 90 % of the video memory target).
+	uint64_t                                          m_base_trigger_gc_memory  = 0;
+	uint64_t                                          m_base_pressure_gc_memory = 0;
+	uint64_t                                          m_base_critical_gc_memory = 0;
+	// What the collector last wrote into the thresholds: values that differ were set anew
+	// (the constructor's caps, a test's configuration) and become the base.
+	uint64_t                                          m_applied_trigger_gc_memory  = UINT64_MAX;
+	uint64_t                                          m_applied_pressure_gc_memory = UINT64_MAX;
+	uint64_t                                          m_applied_critical_gc_memory = UINT64_MAX;
+	// Engine method: images the guest dropped from its texture heaps (no key refers to them any
+	// more), freed once no draw has used them for a few frames, whatever the memory pressure.
+	uint64_t                                          m_pinned_bytes = 0;
+	uint64_t                                          m_pinned_frame = UINT64_MAX;
+	std::vector<ImageId>                              m_guest_dropped;
+	uint64_t                                          m_guest_dropped_freed       = 0;
+	uint64_t                                          m_guest_dropped_freed_bytes = 0;
+	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t         m_gc_tick                = 0;
+	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.
+	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_freed_bytes_frame   = 0;
+	size_t           m_gc_freed_images_frame  = 0;
+	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// Two-phase eviction of GPU-written images: the write-back is deferred until the GPU is done,
+	// and the image stays registered until it has landed. Freeing it at once let a draw in between
+	// recreate it from the old guest bytes, without what the GPU had drawn into it (the glyph
+	// atlases: "half of the text is missing", 2026-10-09). One used again in the meantime stays.
+	struct PendingEviction {
+		ImageId                            id;
+		uint64_t                           address = 0; // the slot may be reused: checked
+		uint64_t                           frame   = 0; // frame_accessed_last at eviction
+		std::shared_ptr<std::atomic<bool>> landed;
 	};
-	uint32_t                                      m_texel_logs = 0;
-	std::unordered_set<std::string>               m_texel_log_seen;
-	std::unordered_map<std::string, DroppedImage> m_dropped_images;
-	uint32_t                                      m_dropped_logs           = 0;
-	mutable uint32_t                              m_image_query_epoch      = 0;
-	bool                                          m_readback_linear_images = false;
+	std::vector<PendingEviction> m_pending_evictions;
+	std::unordered_set<ImageId>  m_evicting;
+	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
+	// stretch without presents (a loading screen) still ages its entries.
+	[[nodiscard]] uint64_t LruClock() const noexcept;
+	mutable uint32_t m_image_query_epoch      = 0;
+	// Recent FindImagesInRegion results. A result depends only on the data ranges of the images
+	// registered on its pages, so it stays valid until an image registers or unregisters there.
+	// The ids live apart from the keys, so an invalidation scans only the keys.
+	struct RegionQuery {
+		uint64_t address      = 0;
+		uint64_t size         = 0;
+		uint64_t epoch        = 0;
+		bool     page_overlap = false;
+		uint8_t  count        = 0;
+	};
+	static constexpr uint32_t                                          RegionQueryBits = 11;
+	mutable std::array<RegionQuery, 1u << RegionQueryBits>             m_region_queries {};
+	mutable std::array<std::array<ImageId, 16>, 1u << RegionQueryBits> m_region_query_ids {};
+	// Bumping it drops every cached query.
+	uint64_t m_registry_epoch = 1;
+	// FindImage's result for a description (KYTY_FIND_IMAGE_MEMO=0: off): valid while no image was
+	// registered or unregistered since (m_image_set_epoch), and checked with SameBacking again.
+	struct FindImageMemo {
+		uint64_t   epoch   = 0;
+		uint64_t   address = 0;
+		uint64_t   size    = 0;
+		ImageId    id;
+		vk::Format format  = vk::Format::eUndefined;
+		uint32_t   type    = 0;
+		bool       exact   = false;
+	};
+	static constexpr size_t            FindImageMemoEntries = 4096;
+	std::vector<FindImageMemo>         m_find_image_memo;
+	uint64_t                           m_image_set_epoch = 1;
+	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

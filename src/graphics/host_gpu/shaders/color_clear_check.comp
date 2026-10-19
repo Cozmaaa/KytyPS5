@@ -1,0 +1,70 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// The fast-clear check of one color-metadata slice (TextureCache::MaterializeColorClear), on the
+// GPU: the metadata is GPU-written, and reading it on the CPU drained the GPU (5-13 ms a frame in
+// UFC 5 fights). Writes one predicate per candidate clear code (1: every byte of the slice is that
+// code) for the conditional clears that follow, and expands a matched slice's keys to 0xff.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Metadata {
+    uint words[];
+};
+
+layout(std430, binding = 0) writeonly buffer Predicates {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 metadata_address;
+    uint  dwords;
+    uint  codes_low;    // candidate codes 0-3, one per byte
+    uint  codes_high;   // candidate codes 4-7
+    uint  code_count;
+    uint  output_dword; // predicates[output_dword + k]: code k matched; [output_dword + 8]: any
+    uint  expand;       // non-zero: a matched slice's metadata becomes 0xff
+} pc;
+
+shared uint mixed;
+
+uint Code(uint k) {
+    return ((k < 4u ? pc.codes_low : pc.codes_high) >> (8u * (k & 3u))) & 0xffu;
+}
+
+void main() {
+    Metadata metadata = Metadata(pc.metadata_address);
+    const uint thread = gl_LocalInvocationIndex;
+    if (thread == 0u) {
+        mixed = 0u;
+    }
+    barrier();
+    const uint first   = metadata.words[0] & 0xffu;
+    const uint pattern = first * 0x01010101u;
+    for (uint i = thread; i < pc.dwords; i += 256u) {
+        if (metadata.words[i] != pattern) {
+            atomicOr(mixed, 1u);
+            break;
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    bool matched = false;
+    for (uint k = 0u; k < pc.code_count; k++) {
+        matched = matched || (mixed == 0u && Code(k) == first);
+    }
+    if (thread < 8u) {
+        predicates[pc.output_dword + thread] =
+            (mixed == 0u && thread < pc.code_count && Code(thread) == first) ? 1u : 0u;
+    }
+    if (thread == 0u) {
+        predicates[pc.output_dword + 8u] = matched ? 1u : 0u;
+    }
+    // Every thread finished reading before the barrier above, so the slice can be rewritten.
+    if (matched && pc.expand != 0u) {
+        for (uint i = thread; i < pc.dwords; i += 256u) {
+            metadata.words[i] = 0xffffffffu;
+        }
+    }
+}

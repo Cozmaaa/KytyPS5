@@ -32,6 +32,10 @@ extern const std::array<cp_op_parser_func_t, 256>          g_cp_op_func;
 extern const std::array<cp_op_parser_func_t, Pm4::R_NUM>   g_cp_op_custom_func;
 
 void GraphicsInitJmpTables();
+// Whether CpOpSetContextReg, CpOpSetShaderReg or CpOpSetUconfigReg (by the packet's opcode) takes
+// the packet's registers instead of exiting on them; true for other opcodes. Applies nothing: the
+// draw-prep scanner, which reads command memory ahead of the GPU thread, taints its scan on false.
+[[nodiscard]] bool CpRegisterPacketAccepted(uint32_t cmd_id, const uint32_t* buffer);
 void GraphicsInitJmpTablesCxIndirect();
 void GraphicsInitJmpTablesShIndirect();
 void GraphicsInitJmpTablesUcIndirect();

@@ -2,10 +2,14 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include <atomic>
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,13 +63,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
-	KYTY_PROFILER_NAMED_FUNCTION(create_zone);
-	create_zone.Value(size);
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size  = size;
-	buffer_info.usage = flags;
+	buffer_info.size        = size;
+	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
@@ -73,28 +76,51 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
-	allocation_info.usage          = AllocationUsage(usage);
+	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        create        = [&] {
-		return static_cast<vk::Result>(
-		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
-		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	const auto        create        = [&](const VmaAllocationCreateInfo& create_info) {
+        return static_cast<vk::Result>(vmaCreateBuffer(
+            graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &create_info,
+            &native_buffer, &m_allocation, &allocation_result));
 	};
-	auto result = create();
+	auto result = create(allocation_info);
 	if (result != vk::Result::eSuccess) {
-		// The memory may still be queued on the release thread.
-		graphics.FinishReleases();
-		result = create();
+		// The heap it prefers is out of budget: video memory, on a 4-8 GB card, for the game's
+		// large buffers. As images do (GraphicContext::CreateImage), take system memory and pay in
+		// bandwidth rather than stop; then the preferred heap past its budget, which the driver
+		// may still serve by paging. Only when both fail is the session out of memory.
+		auto spill           = allocation_info;
+		spill.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		spill.preferredFlags = 0;
+		const auto first     = result;
+		result               = create(spill);
+		const char* where    = "system memory";
+		if (result != vk::Result::eSuccess) {
+			auto over  = allocation_info;
+			over.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			result     = create(over);
+			where      = "the preferred heap past its budget";
+		}
+		static std::atomic<uint32_t> spills {0};
+		if (spills.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("Buffer spilled (%s): %" PRIu64 " MB, usage %d, first attempt %s -> %s\n", where,
+			     size >> 20u, static_cast<int>(usage), vk::to_string(first).c_str(),
+			     vk::to_string(result).c_str());
+		}
 	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
+		EXIT("Out of memory: a %" PRIu64 " MB GPU buffer fits neither in video memory nor in system "
+		     "memory (%s). The VMA heap lines above give usage and budget. Close other programs; on "
+		     "a card with little video memory lower the resolution; if Windows' commit limit is "
+		     "reached, enlarge the page file.\n",
+		     size >> 20u, vk::to_string(result).c_str());
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -114,9 +140,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	KYTY_PROFILER_FUNCTION();
 	if (m_buffer != nullptr) {
-		m_graphics->ReleaseBuffer(m_buffer, m_allocation);
+		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
 
@@ -132,7 +157,8 @@ bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
-		const auto result = vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
+		const auto result =
+		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -186,7 +212,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
@@ -212,7 +238,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
@@ -331,9 +357,16 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
-		if (Usage() == MemoryUsage::Download) {
-			Scheduler().WaitPriorityOperations(watch.tick);
+		// Profiling-only zone: a stream-buffer ring wrap forcing the CPU to wait for the GPU to
+		// finish with the memory it's about to reclaim. Scheduler().IsFree() above is the fast,
+		// non-blocking path -- only reaching Wait() itself means the GPU genuinely hasn't caught
+		// up yet.
+		{
+			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
+			Scheduler().Wait(watch.tick);
+			if (Usage() == MemoryUsage::Download) {
+				Scheduler().WaitPriorityOperations(watch.tick);
+			}
 		}
 		wait_bound = watch.upper_bound;
 		++wait_cursor;
