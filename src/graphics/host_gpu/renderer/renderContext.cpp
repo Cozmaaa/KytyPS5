@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/hostImport.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
@@ -11,11 +13,10 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -165,13 +166,37 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			return;
 		}
 	}
+	// What an unmap must not overtake is work that writes these guest bytes when it completes:
+	// GPU-written buffer pages (InvalidateMemory downloads them), buffer downloads in flight and
+	// image write-backs in flight (WriteBacking ends the session on unmapped memory). Buffers and
+	// images over the range are released after the ticks that use them (DeleteImage), and other
+	// completions (labels, flips, interrupts) do not depend on it. Draining for any cached range or
+	// any pending completion was ~1 ms a frame in UFC 5 fights, in stalls of 3-8 ms (ufc44,
+	// 2026-10-19). With KYTY_HOST_IMPORT=1 the GPU reads guest memory itself, so every unmap of a
+	// cached range still drains. KYTY_UNMAP_NARROW_DRAIN=0 drains as before.
+	static const Common::AbSwitch<bool> narrow_drain(
+	    "KYTY_UNMAP_NARROW_DRAIN",
+	    [](const char* value) { return value == nullptr || value[0] != '0'; });
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		bool drain = false;
+		if (m_command_scheduler.Active() && narrow_drain.Get() &&
+		    HostImport::Get(m_graphics) == nullptr) {
+			drain = m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+			        !m_buffer_cache.IsCleanForConcurrentRead(vaddr, size) ||
+			        m_texture_cache.IsWriteBackInFlight(vaddr, size);
+			if (!drain) {
+				// What the drain did besides: run the completions of finished ticks (fault
+				// reports among them) before the range goes.
+				m_command_scheduler.PopPendingOperations();
+			}
+		} else if (m_command_scheduler.Active()) {
+			drain = m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+			        m_texture_cache.IsRegionRegistered(vaddr, size) ||
+			        m_command_scheduler.HasPendingPriorityOperations();
+		}
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

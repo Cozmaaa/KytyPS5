@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,6 +77,8 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	// Any thread: an image write-back (DownloadImageMemory) to these bytes has not landed yet.
+	[[nodiscard]] bool IsWriteBackInFlight(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -234,6 +237,10 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Guest ranges of the write-backs queued by DownloadImageMemory, until each lands (on the
+	// scheduler's priority thread). A guest unmap of them waits for the GPU; others do not.
+	std::mutex                                        m_writeback_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_writebacks_in_flight;
 	std::unique_ptr<ColorClearCheck>                  m_clear_check;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

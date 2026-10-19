@@ -4203,12 +4203,21 @@ public:
               cache.IsRegionRegistered(index_begin - 1, index_span + 2),
           "indexed lookup mishandled a half-open boundary, gap, or broad "
           "overlap");
+      // Nothing in flight writes a clean cached range, so its unmap does not drain
+      // (RenderContext::UnmapMemory; KYTY_UNMAP_NARROW_DRAIN=0 drains, as before).
+      const bool narrow_unmap_drain = [] {
+        const char *value = std::getenv("KYTY_UNMAP_NARROW_DRAIN");
+        return value == nullptr || value[0] != '0';
+      }();
       const auto clean_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(index_begin, index_page);
       Require(name, "clean cached buffer unmap drain",
-              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
+              scheduler.CurrentTick() ==
+                      clean_unmap_tick + (narrow_unmap_drain ? 0 : 1) &&
                   !resources.IsMapped(index_begin, index_page),
-              "unmapping a clean cached buffer did not drain native work");
+              narrow_unmap_drain
+                  ? "unmapping a clean cached buffer drained native work"
+                  : "unmapping a clean cached buffer did not drain native work");
       resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
@@ -7396,11 +7405,18 @@ public:
               "image lookup mishandled a partial overlap or adjacent range");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      // No write-back of the image is in flight, so its unmap does not drain
+      // (KYTY_UNMAP_NARROW_DRAIN=0 drains, as before).
+      const bool narrow_image_unmap_drain = [] {
+        const char *value = std::getenv("KYTY_UNMAP_NARROW_DRAIN");
+        return value == nullptr || value[0] != '0';
+      }();
       const auto image_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(image_address + 0x1000, 0x1000);
       Require(name, "partial image unmap tracking",
               partial_unmap_image_id &&
-                  scheduler.CurrentTick() == image_unmap_tick + 1 &&
+                  scheduler.CurrentTick() ==
+                      image_unmap_tick + (narrow_image_unmap_drain ? 0 : 1) &&
                   !texture_cache.IsRegionRegistered(image_address, 0x2000) &&
                   !texture_cache.FindImageFromRange(image_address, 0x2000, false),
               "partial image unmap skipped its drain or retained the image");

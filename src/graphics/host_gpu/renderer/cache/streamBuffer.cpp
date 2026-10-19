@@ -5,11 +5,12 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -70,9 +71,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
 
+	// The allocator gives every block device addresses, so small BDA buffers share blocks. A
+	// dedicated allocation costs a vkAllocateMemory call, about 80 us, and the buffer cache creates
+	// ~8 buffers a frame in UFC 5 fights (0.64 ms a frame, ufc44). Large ones stay dedicated, so
+	// freeing them returns memory to the usage the collectors measure.
+	// KYTY_SHARED_BDA_MB sets the limit (default 8; 0: every BDA buffer dedicated, as before).
+	static const uint64_t shared_bda_size = [] {
+		const char* value = std::getenv("KYTY_SHARED_BDA_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {8}) << 20u;
+	}();
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && size > shared_bda_size ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -89,6 +99,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
             &native_buffer, &m_allocation, &allocation_result));
 	};
 	auto result = create(allocation_info);
+	if (result != vk::Result::eSuccess && with_bda && bda_flag == 0) {
+		// A new block may not fit the budget where the buffer alone does.
+		allocation_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+		result = create(allocation_info);
+	}
 	if (result != vk::Result::eSuccess) {
 		// The heap it prefers is out of budget: video memory, on a 4-8 GB card, for the game's
 		// large buffers. As images do (GraphicContext::CreateImage), take system memory and pay in

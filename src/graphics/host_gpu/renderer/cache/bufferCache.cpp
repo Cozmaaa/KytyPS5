@@ -1770,6 +1770,21 @@ void BufferCache::RunGarbageCollector() {
 	if (dirty_buffers.empty()) {
 		return;
 	}
+	static const Common::AbSwitch<bool> sync_download(
+	    "KYTY_GC_SYNC_DOWNLOAD",
+	    [](const char* value) { return value != nullptr && value[0] == '1'; });
+	if (!over_trigger && !sync_download.Get()) {
+		// Idle collection frees no memory the cache needs now, so the downloads publish as an
+		// asynchronous readback does, and a later pass finds the buffers' bytes in guest memory
+		// and retires them as clean (the "downloading" case above). Waiting here drained the
+		// GPU ~0.7 times a frame, 0.72 ms a frame in the fight (ufc44, 2026-10-19). The tick is
+		// the last copy's, as in ReadMemoryStep: a guest access to these pages waits for it.
+		// Flushed, because a wait on a tick nobody submits never returns on the GPU thread.
+		// KYTY_GC_SYNC_DOWNLOAD=1 waits as before.
+		m_last_async_download_tick = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+		return;
+	}
 
 	// Publish all queued downloads before releasing their tracked pages and owners. Must be
 	// CurrentTick(): DownloadBufferMemory above queued copy-out commands into the currently open

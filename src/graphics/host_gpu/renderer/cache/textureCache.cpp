@@ -2537,14 +2537,30 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		landed_flag = std::make_shared<std::atomic<bool>>(false);
 		*landed     = landed_flag;
 	}
-	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
+	{
+		std::lock_guard lock(m_writeback_mutex);
+		m_writebacks_in_flight.emplace_back(range.address, range.size);
+	}
+	m_scheduler.DeferPriorityOperation([this, download, dedicated, range, mapped, offset, guard,
 	                                    guest_hash, landed_flag] {
 		struct Landed {
+			TextureCache&                             cache;
+			const GuestRange&                         range;
 			const std::shared_ptr<std::atomic<bool>>& flag;
 			~Landed() {
+				{
+					std::lock_guard lock(cache.m_writeback_mutex);
+					auto&           list = cache.m_writebacks_in_flight;
+					const auto      entry =
+					    std::find(list.begin(), list.end(), std::pair {range.address, range.size});
+					if (entry != list.end()) {
+						*entry = list.back();
+						list.pop_back();
+					}
+				}
 				if (flag != nullptr) flag->store(true, std::memory_order_release);
 			}
-		} landed_scope {landed_flag};
+		} landed_scope {*this, range, landed_flag};
 		download->Invalidate(offset, range.size);
 		uint64_t current = 0;
 		if (guard && (!HashGuestBacking(range.address, range.size, current) ||
@@ -2648,6 +2664,14 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
+}
+
+bool TextureCache::IsWriteBackInFlight(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_writeback_mutex);
+	return std::any_of(
+	    m_writebacks_in_flight.begin(), m_writebacks_in_flight.end(), [&](const auto& entry) {
+		    return entry.first < address + size && address < entry.first + entry.second;
+	    });
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
