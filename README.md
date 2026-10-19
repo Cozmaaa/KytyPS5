@@ -6,6 +6,8 @@
 > UFC 5-specific workarounds that are not meant for upstream. Report problems with this fork here,
 > not to the upstream project.
 
+**Credits** to [roshanarunk](https://github.com/roshanarunk) for finding some improvements.
+
 ## Known issues
 
 - **Random crashes** with `vkQueueSubmit failed: ErrorDeviceLost`, either early while loading or
