@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/abSwitch.h"
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/hostImport.h"
@@ -99,6 +101,36 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+// KYTY_FAULT_AHEAD_PAGES=N (default 16, 0: off; per A/B arm, common/abSwitch.h): a write fault on
+// the page right after the ones the thread's previous write fault made writable makes the next
+// pages after it writable as well, twice as many as last time, up to N; any other write fault
+// starts again from none. In a UFC 5 fight (ufc51) the game threads took ~80k write faults a
+// second, 95 % of them on the page after their previous fault ~3 us before: they write through
+// buffers page by page after the BDA walk (PrepareBda) protected them again. Replayed on that
+// trace, 16 pages leaves 20 % of the faults and makes ~27 MB/s of pages dirty that are never
+// written (uploaded once more, as after a write).
+static uint64_t FaultAheadLimit() {
+	static const Common::AbSwitch<uint64_t> limit("KYTY_FAULT_AHEAD_PAGES", [](const char* value) {
+		return std::min<uint64_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull, 256);
+	});
+	return limit.Get();
+}
+
+// Pages after fault_vaddr's page to make writable along with it.
+static uint64_t FaultAheadPages(uint64_t fault_vaddr) {
+	struct Stream {
+		uint64_t next_page = ~uint64_t {0};
+		uint64_t ahead     = 0;
+	};
+	thread_local Stream stream;
+	const auto          limit = FaultAheadLimit();
+	const auto          page  = fault_vaddr / TRACKER_PAGE_SIZE;
+	stream.ahead =
+	    limit != 0 && page == stream.next_page ? std::clamp<uint64_t>(stream.ahead * 2, 1, limit) : 0;
+	stream.next_page = page + 1 + stream.ahead;
+	return stream.ahead;
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -107,7 +139,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// Only the buffer tracker's pages go ahead: the texture cache and the bindless table
+		// keep their own watches, so their pages still fault when they are written.
+		auto       ahead     = FaultAheadPages(fault_vaddr);
+		const auto next_page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE) + TRACKER_PAGE_SIZE;
+		if (ahead != 0 && !IsMapped(next_page, ahead * TRACKER_PAGE_SIZE)) {
+			ahead = 0;
+		}
+		m_buffer_cache.InvalidateWriteFault(fault_vaddr, ahead);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
@@ -177,13 +216,28 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	static const Common::AbSwitch<bool> narrow_drain(
 	    "KYTY_UNMAP_NARROW_DRAIN",
 	    [](const char* value) { return value == nullptr || value[0] != '0'; });
-	const auto unmap = [this, vaddr, size] {
+	// GPU-written bytes are downloaded before the unmap reaches the GPU thread: the GPU thread
+	// queues the download and goes on, and the unmapping thread waits for its publication. In a
+	// UFC 5 fight (ufc54) 404 of 2,200 unmaps, nearly all of 2 MiB, drained the GPU on the GPU
+	// thread (p50 0.65 ms, p90 7.2 ms; up to 17 % of a second) and then downloaded synchronously,
+	// every one of them for GPU-written bytes. The unmap itself then drains only for what is
+	// still GPU-written or downloading (GPU work recorded in between): pages marked GPU-written
+	// without such bytes are current in guest memory (ReadMemoryStep lifts them without the GPU).
+	// KYTY_UNMAP_ASYNC_DOWNLOAD=0 (per A/B arm) drains on the GPU thread as before.
+	static const Common::AbSwitch<bool> async_download(
+	    "KYTY_UNMAP_ASYNC_DOWNLOAD",
+	    [](const char* value) { return value == nullptr || value[0] != '0'; });
+	const bool download_first = narrow_drain.Get() && async_download.Get();
+	const auto unmap          = [this, vaddr, size, download_first] {
+		// Zone value: the size.
+		KYTY_PROFILER_NAMED_BLOCK(unmap_zone, "GPU unmap");
+		unmap_zone.Value(size);
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		bool drain = false;
 		if (m_command_scheduler.Active() && narrow_drain.Get() &&
 		    HostImport::Get(m_graphics) == nullptr) {
-			drain = m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+			drain = (!download_first && m_buffer_cache.IsRegionGpuModified(vaddr, size)) ||
 			        !m_buffer_cache.IsCleanForConcurrentRead(vaddr, size) ||
 			        m_texture_cache.IsWriteBackInFlight(vaddr, size);
 			if (!drain) {
@@ -197,6 +251,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			        m_command_scheduler.HasPendingPriorityOperations();
 		}
 		if (drain) {
+			KYTY_PROFILER_BLOCK("GPU unmap: drain");
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -213,6 +268,24 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
+	if (download_first && !m_buffer_cache.IsCleanForConcurrentRead(vaddr, size)) {
+		KYTY_PROFILER_NAMED_BLOCK(download_zone, "Guest unmap: download");
+		download_zone.Value(size);
+		uint64_t tick = 0;
+		m_gpu->SendCommandSync([this, vaddr, size, &tick] {
+			KYTY_PROFILER_BLOCK("GPU unmap: download");
+			if (m_command_scheduler.Active() && HostImport::Get(m_graphics) == nullptr) {
+				tick = m_buffer_cache.DownloadBeforeUnmap(vaddr, size);
+			}
+		});
+		if (tick != 0) {
+			KYTY_PROFILER_BLOCK("Guest unmap: download wait");
+			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+	}
+	// The unmapping thread's wait for the GPU thread (value: the size).
+	KYTY_PROFILER_NAMED_BLOCK(wait_zone, "Guest unmap: GPU wait");
+	wait_zone.Value(size);
 	m_gpu->SendCommandSync(unmap);
 }
 
@@ -288,6 +361,7 @@ void RenderContext::PrepareBda() {
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
+		KYTY_PROFILER_BLOCK("Bda::Walk");
 		std::shared_lock lock(m_mapped_ranges_mutex);
 		m_bda_walk_enqueued  = g_guest_enqueued_seq.load(std::memory_order_acquire);
 		m_bda_walk_gpu_dirty = g_gpu_thread_dirty_seq;
@@ -334,12 +408,16 @@ void RenderContext::PrepareBda() {
 // heads in the crowd), so some data a draw needs is outside the ranges or the walk was syncing it
 // for another path; and it halved the protection changes without a measurable gain (2026-10-15:
 // 28.4 vs 27.7 fps standing, 11.3 vs 11.2 us a draw).
-bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+bool RenderContext::BdaReadPlansEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BDA_READ_PLAN");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (!enabled || ranges.empty() || ranges.size() > 128 ||
+	return enabled;
+}
+
+bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+	if (!BdaReadPlansEnabled() || ranges.empty() || ranges.size() > 128 ||
 	    std::ranges::any_of(ranges, [](const GuestRange& range) { return !range.Valid(); })) {
 		return false;
 	}

@@ -5,6 +5,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -14,10 +17,42 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
+uint32_t SamplerCache::NewSerial() {
+	static std::atomic<uint32_t> serial {0};
+	return ++serial;
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	// Every sampler of every draw came through the lock and the map; a frame of a UFC 5 fight uses
+	// a few dozen distinct ones. The cache only grows until it is destroyed, so a handle found
+	// once stays valid while this cache (its serial) lives. KYTY_SAMPLER_FRONT=0 turns this off.
+	static const bool front_enabled = [] {
+		const char* value = std::getenv("KYTY_SAMPLER_FRONT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!front_enabled) {
+		return FindOrCreate(key, r, integer_border);
+	}
+	struct FrontEntry {
+		SamplerKey  key {};
+		uint32_t    serial  = 0;
+		vk::Sampler sampler = nullptr;
+	};
+	thread_local std::array<FrontEntry, 256> front {};
+	auto& entry = front[SamplerKeyHash {}(key) % front.size()];
+	if (entry.serial == m_serial && entry.key == key) {
+		return entry.sampler;
+	}
+	const auto sampler = FindOrCreate(key, r, integer_border);
+	entry              = {key, m_serial, sampler};
+	return sampler;
+}
+
+vk::Sampler SamplerCache::FindOrCreate(const SamplerKey& key, const ShaderSamplerResource& r,
+                                       bool integer_border) {
 	Common::LockGuard lock(m_mutex);
 
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}

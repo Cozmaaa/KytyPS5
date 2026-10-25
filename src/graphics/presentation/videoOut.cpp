@@ -1,5 +1,6 @@
 #include "graphics/presentation/videoOut.h"
 
+#include "common/abSwitch.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <client/TracyProfiler.hpp>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -218,7 +220,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	bool Flip(uint32_t micros, bool between_vblanks = false);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -495,11 +497,15 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool between_vblanks) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
 	const int interval = cfg.flip_rate + 1;
+	if (between_vblanks) {
+		// Only a port that flips at every vblank takes a flip between them (KYTY_FLIP_LATCH_STEPS).
+		return interval <= 1;
+	}
 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
@@ -858,12 +864,36 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+// KYTY_FLIP_LATCH_STEPS=N (1-8, default 2; 1: off): each vblank period is split into N steps, and a
+// flip that missed its vblank is presented at the next step instead of a whole period later, at
+// most one flip a period. The game still sees vblanks at the display rate and no more flips than
+// vblanks. In a UFC 5 fight (ufc50) every present came 16.7 or 33.3 ms after the one before, a
+// third of them 33.3: frames that missed a vblank by a few milliseconds. With 2 steps the fights
+// ran visibly faster at the right game speed (2026-10-25); a 120 Hz vblank instead made the game
+// itself run too fast, since its speed follows the frame rate it sees. Per A/B arm
+// (common/abSwitch.h): in ufc52 (2 steps) presents still came 16.7 or 25 ms apart, 45 % at 25,
+// for 16-18 ms of GPU-thread work a frame.
+static uint32_t FlipLatchSteps() {
+	static const Common::AbSwitch<uint32_t> steps("KYTY_FLIP_LATCH_STEPS", [](const char* value) {
+		const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 2ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 1, 8));
+	});
+	return steps.Get();
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	Common::PlaceCurrentThread(Common::ThreadClass::High, "present thread");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
+	auto latch_steps = FlipLatchSteps(); // read again at each vblank: the A/B arm can change it
+	if (latch_steps > 1) {
+		LOGF("VideoOut: a late flip is presented at the next of %u steps a vblank period\n",
+		     latch_steps);
+	}
 
-	int64_t total_wait = 0;
+	int64_t  total_wait = 0;
+	uint32_t step       = 0;     // of the current vblank period
+	bool     flipped    = false; // in the current vblank period
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
@@ -878,19 +908,38 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		const auto refresh       = std::max(Config::GetVblankFrequency(), 1u);
+		const auto vblank_period = std::max(frequency / refresh, uint64_t {1});
+		if (step == 0) {
+			latch_steps = FlipLatchSteps();
+		}
+		const auto period = std::max(vblank_period / latch_steps, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait +=
-			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			total_wait += static_cast<int64_t>(vblank_period) -
+			              static_cast<int64_t>(frame_end - frame_begin);
+			step    = 0;
+			flipped = false;
 			continue;
 		}
 
+		if (step != 0) {
+			// Between vblanks: only a flip that missed this period's vblank.
+			if (!flipped) {
+				flipped = m_flip_queue.Flip(0, true);
+			}
+			step = (step + 1) % latch_steps;
+			const auto frame_end = Common::Timer::QueryPerformanceCounter();
+			total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			continue;
+		}
+		step = latch_steps > 1 ? 1 : 0;
+
 		VblankBegin();
-		bool presented = m_flip_queue.Flip(0);
+		flipped        = m_flip_queue.Flip(0);
+		bool presented = flipped;
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
 				presented = true;
@@ -1204,7 +1253,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip(uint32_t micros, bool between_vblanks) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1249,7 +1298,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->mutex.Lock();
 		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
 		if (r.id == group) {
-			due &= IsFlipDueLocked(*r.cfg, r.generation);
+			due &= IsFlipDueLocked(*r.cfg, r.generation, between_vblanks);
 		}
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}

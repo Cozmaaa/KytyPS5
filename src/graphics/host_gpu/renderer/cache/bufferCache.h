@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -71,6 +72,10 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A game thread's write fault: InvalidateMemory of the faulting byte, plus up to ahead_pages
+	// clean pages after its page made CPU-dirty (the next pages of a sequential write). Returns
+	// the pages marked ahead.
+	uint64_t               InvalidateWriteFault(uint64_t vaddr, uint64_t ahead_pages);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -123,6 +128,10 @@ public:
 	// Drops the known fills a GPU write outside the buffer path overlaps (an image write: render
 	// target, storage image, image copy or clear). Those never reach MarkGpuWritten.
 	void ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	// The same for a caller that forgets one range again and again (each bound render target, every
+	// draw): `generation` (0 at first) remembers the call, and while no fill or clear check was
+	// recorded anywhere since, the range cannot hold one and the lock and search are skipped.
+	void ForgetKnownFills(uint64_t vaddr, uint64_t size, uint64_t& generation);
 	// Color metadata the GPU-side clear check (TextureCache::MaterializeColorClearOnGpu) already
 	// examined, until a GPU write marks bytes of it again (the same rule as known fills): the
 	// check of an unchanged slice finds nothing new, so it is skipped.
@@ -167,6 +176,10 @@ public:
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
+	// GPU thread, before [vaddr, vaddr + size) is unmapped: starts downloading what the GPU wrote
+	// there, as an asynchronous readback does, without waiting. The tick whose publication the
+	// unmapping thread waits for, or 0 when no byte there is GPU-written or on its way back.
+	[[nodiscard]] uint64_t          DownloadBeforeUnmap(uint64_t vaddr, uint64_t size);
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -256,6 +269,8 @@ private:
 	void EraseKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	// MarkClearChecked ranges: begin -> end. Guarded and erased with m_known_fills.
 	std::map<uint64_t, uint64_t>                        m_clear_checked;
+	// Bumped, under m_dirty_ranges_mutex, by every entry added to either map above.
+	std::atomic<uint64_t>                               m_known_fills_generation {1};
 	// SyncBatch (BeginSyncBatch, FlushSyncBatch): uploads recorded together.
 	struct PendingSyncCopy {
 		vk::Buffer source;
@@ -264,13 +279,20 @@ private:
 		uint32_t   first_copy       = 0;
 		uint32_t   copy_count       = 0;
 	};
-	// SynchronizeCpuDirtyBuffersInRange scratch: each buffer's dirty span.
+	// SynchronizeCpuDirtyBuffersInRange scratch: each buffer's dirty span, and its copies in
+	// m_walk_copies (SynchronizeWalkSpans).
 	struct WalkSpan {
 		BufferId id;
-		uint64_t begin = 0;
-		uint64_t end   = 0;
+		uint64_t begin       = 0;
+		uint64_t end         = 0;
+		uint64_t copy_bytes  = 0;
+		uint32_t first_copy  = 0;
+		uint32_t copy_count  = 0;
 	};
 	std::vector<WalkSpan>                               m_walk_spans;
+	std::vector<vk::BufferCopy>                         m_walk_copies;
+	void                                                SynchronizeWalkSpans();
+	void RecordSyncCopies(Buffer& buffer, vk::Buffer source, std::span<const vk::BufferCopy> copies);
 	bool                                                m_sync_batching = false;
 	uint64_t                                            m_sync_batch_tick = 0;
 	std::vector<PendingSyncCopy>                        m_sync_batch;

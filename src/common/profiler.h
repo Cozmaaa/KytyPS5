@@ -31,6 +31,11 @@ void MarkFrame();
 void Initialize();
 void Shutdown();
 
+// KYTY_PROFILE_FINE=1: also the zones of the hottest small calls (KYTY_PROFILER_FINE_BLOCK), tens
+// of nanoseconds each and 10,000-20,000 a frame (UFC 5 fight: ~115,000 of ~206,000 zones a frame
+// on the GPU thread). Without it their time counts to the caller's zone and they cost a branch.
+inline bool g_fine_zones = false;
+
 // KYTY_PROFILE_ZONES=0: no zones, only Tracy's call-stack sampling and context switches (with an
 // elevated process). ~300,000 zones a frame inflated the share of small functions that open one.
 inline bool g_zones = true;
@@ -78,6 +83,12 @@ enum class Counter : uint32_t {
 	ImagesDestroyed,
 	// Bindless texture keys resolved.
 	BindlessResolved,
+	// Faults of guest threads on pages the GPU caches watch (a CPU write, or a read of
+	// GPU-written bytes), and the time their handler took in nanoseconds (not counting the host's
+	// exception dispatch).
+	CpuWriteFaults,
+	CpuReadFaults,
+	CpuFaultTime,
 	Total
 };
 
@@ -193,6 +204,22 @@ struct Lifecycle {
 	    TRACY_CALLSTACK, tracy::ProfilerAvailable() && Profiler::g_zones)
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
+
+// Like KYTY_PROFILER_BLOCK, for a hot call of a few tens of nanoseconds: recorded only with
+// KYTY_PROFILE_FINE=1 (Profiler::g_fine_zones), which is checked before anything else.
+#define KYTY_PROFILER_FINE_BLOCK(name, ...)                                                        \
+	KYTY_PROFILER_FINE_BLOCK_IMPL(__LINE__, name __VA_OPT__(, ) __VA_ARGS__)
+#define KYTY_PROFILER_FINE_BLOCK_IMPL(line, name, ...)                                             \
+	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
+	    kyty_profiler_source_location_, line) {name, TracyFunction, TracyFile,                     \
+	                                           static_cast<uint32_t>(line),                        \
+	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
+	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line), TRACY_CALLSTACK,             \
+	    Profiler::g_fine_zones && tracy::ProfilerAvailable() && Profiler::g_zones)
+
+#define KYTY_PROFILER_FINE_FUNCTION(...)                                                           \
+	KYTY_PROFILER_FINE_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 
 // Like KYTY_PROFILER_BLOCK, but the zone is declared as `zone`, so a value can be attached
 // with zone.Value().

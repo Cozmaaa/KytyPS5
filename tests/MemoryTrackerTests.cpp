@@ -403,6 +403,41 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuDirtyAhead() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(page * 8, 0x10000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto cpu_dirty = [&](uint64_t index) {
+    return tracker.IsRegionCpuModified(address + page * index, page);
+  };
+
+  // Pages 0-7 clean, page 5 GPU-written.
+  tracker.ForEachUploadRange(
+      address, page * 8, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.ForEachUploadRange(
+      address + page * 5, page, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.MarkCpuDirtyAhead(address + page, 16) == 4 && !cpu_dirty(0) &&
+            cpu_dirty(1) && cpu_dirty(4) && !cpu_dirty(5) && !cpu_dirty(6) &&
+            tracker.IsRegionGpuModified(address + page * 5, page),
+        "fault-ahead did not stop at the GPU-written page");
+  Check(tracker.MarkCpuDirtyAhead(address + page, 16) == 0,
+        "fault-ahead went on from a page that was already CPU dirty");
+  Check(tracker.MarkCpuDirtyAhead(address + page * 6, 1) == 1 &&
+            cpu_dirty(6) && !cpu_dirty(7),
+        "fault-ahead marked more pages than asked");
+  Check(tracker.MarkCpuDirtyAhead(
+            address + Libs::Graphics::TRACKER_REGION_SIZE * 4, 4) == 0,
+        "fault-ahead marked pages outside every region");
+  tracker.UnmarkRegionAsGpuModified(address + page * 5, page);
+  tracker.MarkRegionAsCpuModified(address, page * 8);
+  tracker.UntrackMemory(address, page * 8);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -834,6 +869,60 @@ void TestDirtyRegionWalk() {
   Release(memory);
 }
 
+void TestClearCpuDirtySpans() {
+  // The BDA walk's spans (ClearCpuDirtySpans): two neighbouring spans in one region and one that
+  // crosses into the next. Each dirty range is reported for its own span, every page of a span is
+  // clean and write-protected afterwards, and dirty pages outside the spans stay dirty.
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x800000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, region_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+
+  struct Span {
+    uint64_t begin;
+    uint64_t end;
+  };
+  const std::vector<Span> spans = {
+      {address + page_size * 2, address + page_size * 4},
+      {address + page_size * 4, address + page_size * 8},
+      {address + region_size - page_size, address + region_size + page_size}};
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size * 6);
+  tracker.MarkRegionAsCpuModified(address + page_size * 10, 16);
+  tracker.MarkRegionAsCpuModified(address + region_size - page_size, page_size * 2);
+  std::vector<std::pair<size_t, std::pair<uint64_t, uint64_t>>> ranges;
+  tracker.ClearCpuDirtySpans(
+      spans, [&](size_t index, uint64_t range_address, uint64_t bytes) noexcept {
+        ranges.push_back({index, {range_address, bytes}});
+      });
+  Check(ranges.size() == 4 && ranges[0].first == 0 &&
+            ranges[0].second == std::pair{address + page_size * 2, page_size * 2} &&
+            ranges[1].first == 1 &&
+            ranges[1].second == std::pair{address + page_size * 4, page_size * 3} &&
+            ranges[2].first == 2 &&
+            ranges[2].second == std::pair{address + region_size - page_size, page_size} &&
+            ranges[3].first == 2 &&
+            ranges[3].second == std::pair{address + region_size, page_size},
+        "the span clear did not report each dirty range for its own span");
+  Check(!tracker.IsRegionCpuModified(address + page_size * 2, page_size * 6) &&
+            !tracker.IsRegionCpuModified(address + region_size - page_size, page_size * 2) &&
+            Protection(memory + page_size * 2) == PAGE_READONLY &&
+            Protection(memory + page_size * 6) == PAGE_READONLY &&
+            Protection(memory + region_size) == PAGE_READONLY,
+        "the span clear left a page of a span dirty or writable");
+  Check(tracker.IsRegionCpuModified(address + page_size, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size * 10, 16) &&
+            IsWritable(memory + page_size) && IsWritable(memory + page_size * 10),
+        "the span clear cleared or protected a page outside the spans");
+
+  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(memory);
+}
+
 void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1232,6 +1321,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyAhead();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
@@ -1241,6 +1331,7 @@ int main(int argc, char **argv) {
   TestCrossRegionUpload();
   TestRegionBitmapHint();
   TestDirtyRegionWalk();
+  TestClearCpuDirtySpans();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();

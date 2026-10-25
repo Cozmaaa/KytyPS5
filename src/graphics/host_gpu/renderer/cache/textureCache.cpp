@@ -366,8 +366,11 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	// The page bits are set before TrackImage can protect the image's pages: a write fault that
+	// its protection causes sees them and takes m_lock (InvalidateMemory).
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_image_pages[page / 64].fetch_or(uint64_t {1} << (page % 64), std::memory_order_seq_cst);
 	});
 	image.registered = true;
 	++m_image_set_epoch;
@@ -398,6 +401,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
+		}
+		if (owners->empty()) {
+			m_image_pages[page / 64].fetch_and(~(uint64_t {1} << (page % 64)),
+			                                   std::memory_order_seq_cst);
 		}
 	});
 	m_lru_cache.Free(image.lru_id);
@@ -2030,7 +2037,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	// Image writes bypass BufferCache::MarkGpuWritten, so a fill recorded over memory this image
 	// now reuses would otherwise still answer color-metadata clear checks with stale bytes.
 	if (!image.info.data.Empty()) {
-		m_buffer_cache.ForgetKnownFills(image.info.data.address, image.info.data.size);
+		m_buffer_cache.ForgetKnownFills(image.info.data.address, image.info.data.size,
+		                                image.known_fills_generation);
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -2077,7 +2085,7 @@ bool TextureCache::OverwritesTexel(const Image& writer, const Image& texel) {
 }
 
 void TextureCache::SettleTexelAlias(ImageId id) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_FINE_FUNCTION();
 	auto& texel = m_slot_images[id];
 	if (!IsTexelAlias(texel) || texel.binding.shader_write || texel.binding.is_target ||
 	    !m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
@@ -2312,8 +2320,29 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Every game thread's write fault comes here. Most land where no image is, and m_lock is a
+	// spin lock the GPU thread takes for each texture lookup.
+	if (!MayHaveImages(address, size)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+}
+
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const noexcept {
+	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(begin, end - begin, pages)) {
+		return true;
+	}
+	for (auto page = pages.first; page < pages.last_exclusive; page++) {
+		if ((m_image_pages[page / 64].load(std::memory_order_seq_cst) &
+		     (uint64_t {1} << (page % 64))) != 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {

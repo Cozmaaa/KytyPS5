@@ -9,7 +9,12 @@
 #include <utility>
 #include <vector>
 #include <mutex>
+#include <thread>
 #include <utility>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -32,9 +37,21 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		// A waiter spins on a plain load, with pauses, rather than on test_and_set: an atomic write
+		// a turn took the line from the owner. It yields after a while: the owner may be in a
+		// protection change (VirtualProtect), which waits for the guest address space's lock
+		// while a guest map or unmap holds it, or preempted. The GPU thread and every game
+		// thread's write fault take these locks (~22,000 faults a second in a UFC 5 fight).
+		for (uint32_t spins = 0; m_lock.test_and_set(std::memory_order_acquire);) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			while (m_lock.test(std::memory_order_relaxed)) {
+				if (spins < 256) {
+					spins++;
+					Pause();
+				} else {
+					std::this_thread::yield();
+				}
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -45,6 +62,14 @@ public:
 	}
 
 private:
+	static void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#else
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
@@ -170,8 +195,28 @@ public:
 		}
 	}
 
-	template <DirtySource source, bool clear, typename Func>
+	// A write fault's fault-ahead (MemoryTracker::MarkCpuDirtyAhead): the run of pages from vaddr's
+	// on, at most max_pages and within this region, that are neither CPU- nor GPU-dirty becomes
+	// CPU-dirty, as if each had faulted. Returns the pages marked. The caller holds the lock.
+	size_t MarkCpuDirtyAhead(uint64_t vaddr, size_t max_pages) {
+		const auto start = GetPageRange(vaddr, TRACKER_PAGE_SIZE).first;
+		const auto limit = std::min(TRACKER_REGION_PAGES, start + max_pages);
+		auto       end   = start;
+		while (end < limit && !m_cpu_dirty.Get(end) && !m_gpu_dirty.Get(end)) {
+			end++;
+		}
+		if (end != start) {
+			ChangeState<DirtySource::Cpu, true>(m_cpu_addr + start * TRACKER_PAGE_SIZE,
+			                                    (end - start) * TRACKER_PAGE_SIZE);
+		}
+		return end - start;
+	}
+
+	// protect = false (CPU, clear): the cleared pages stay writable until ProtectCleanCpuPages, so
+	// several clears share one protection pass.
+	template <DirtySource source, bool clear, bool protect = true, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		static_assert(protect || (clear && source == DirtySource::Cpu));
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		if (bits.FirstRangeFrom(start).first >= end) {
@@ -183,9 +228,9 @@ public:
 			if (bits.None()) {
 				StoreSummary<source>(false);
 			}
-			if constexpr (source == DirtySource::Cpu) {
+			if constexpr (protect && source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
-			} else {
+			} else if constexpr (protect) {
 				UpdateProtection<false, true>();
 			}
 		}
@@ -193,6 +238,10 @@ public:
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
 	}
+
+	// Write-protects the pages ForEachModifiedRange<Cpu, true, false> made clean. The caller holds
+	// the lock.
+	void ProtectCleanCpuPages() { UpdateProtection<true, false>(); }
 
 	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
 	// Set before the region is published.

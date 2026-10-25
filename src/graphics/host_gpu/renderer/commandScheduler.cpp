@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "common/abSwitch.h"
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
 #include "common/logging/log.h"
@@ -48,6 +49,17 @@ uint32_t DrawFlushInterval() {
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();
 	return interval;
+}
+
+// KYTY_BARRIER_DEDUP=0 (per A/B arm): every full barrier is recorded, also one right after another.
+// UFC 5's sync macros (EVENT_WRITE partial flushes and cache events, WRITE_DATA, RELEASE_MEM) asked
+// for up to 13 in a row, ~1,300 a frame in ~465 runs, and each drained the host GPU again (ufc60:
+// ~2.6 us per EVENT_WRITE, holes of 4.1 ms a frame).
+bool BarrierDedupEnabled() {
+	static const Common::AbSwitch<bool> enabled("KYTY_BARRIER_DEDUP", [](const char* value) {
+		return value == nullptr || value[0] != '0';
+	});
+	return enabled.Get();
 }
 
 } // namespace
@@ -677,6 +689,27 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	}
 	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
 	return m_worker_buffer;
+}
+
+// Recording appends to m_chunk; a chunk handed over (DispatchChunk: a drain for direct recording,
+// a submit, a full chunk) counts in m_chunks_dispatched, which only this thread changes. The same
+// chunk, last command, count and tick mean nothing was recorded in between.
+void CommandScheduler::MarkSynchronized(const CommandBuffer& command) {
+	if (!m_threaded || &command != &m_command || m_chunk == nullptr || m_chunk->last == nullptr) {
+		m_sync_chunk = nullptr;
+		return;
+	}
+	m_sync_chunk      = m_chunk.get();
+	m_sync_command    = m_chunk->last;
+	m_sync_dispatched = m_chunks_dispatched;
+	m_sync_tick       = CurrentTick();
+}
+
+bool CommandScheduler::Synchronized(const CommandBuffer& command) const {
+	return m_threaded && &command == &m_command && !m_command.IsInvalid() &&
+	       m_sync_chunk != nullptr && m_chunk.get() == m_sync_chunk &&
+	       m_chunk->last == m_sync_command && m_chunks_dispatched == m_sync_dispatched &&
+	       CurrentTick() == m_sync_tick && BarrierDedupEnabled();
 }
 
 void CommandScheduler::RecordingThread(std::stop_token stop) {

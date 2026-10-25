@@ -1045,6 +1045,28 @@ if(LINUX)
     )
 endif()
 
+# Link-time optimization of the emulator's own sources (ThinLTO with clang): the small cache,
+# memory and texture calls every draw makes across source files can be inlined. Upstream's release
+# CI builds everything with CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON; this applies it to kyty_emulator
+# alone, so the tests (which compile their own copies of the sources) keep linking quickly.
+option(KYTY_LTO "Link-time optimization of kyty_emulator" OFF)
+if(KYTY_LTO)
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT kyty_lto_supported OUTPUT kyty_lto_output LANGUAGES C CXX)
+	if(NOT kyty_lto_supported)
+		message(FATAL_ERROR "KYTY_LTO: link-time optimization is not supported: ${kyty_lto_output}")
+	endif()
+	set_property(TARGET kyty_emulator PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+	if(KYTY_CLANG_CL)
+		# Modules a relink did not change keep their optimized code.
+		target_link_options(kyty_emulator PRIVATE
+			"/lldltocache:${CMAKE_CURRENT_BINARY_DIR}/lto-cache"
+			"/lldltocachepolicy:cache_size_bytes=4g"
+		)
+	endif()
+	message(STATUS "LTO: kyty_emulator")
+endif()
+
 if(APPLE)
 	# The emulator writes x86-64 trampolines/PLT stubs into memory and executes them, and
 	# runs guest code under Rosetta. That requires the JIT / unsigned-executable-memory

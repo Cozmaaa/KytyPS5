@@ -369,8 +369,9 @@ public:
 				}
 			}
 		}
-		std::lock_guard lock(m_mutex);
-		MapEntry        entry {};
+		// Shared, like TryReadBacking's: the lookup only reads the mappings.
+		std::shared_lock lock(m_mutex);
+		MapEntry         entry {};
 		if (!FindContainingUnlocked(vaddr, size, &entry)) {
 			return nullptr;
 		}
@@ -1015,12 +1016,17 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// The page tracker's protections only read m_mapped, and the PageManager makes each one with
+	// the spin lock of the page's region held (a change never crosses regions), so changes of one
+	// page are already ordered. A shared lock keeps them from queueing behind each other and behind
+	// the GPU thread's CopySparseMemory reads (upstream 07f64202). The guest's own mprotect and
+	// every map and unmap still take the lock exclusively.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1314,8 +1320,8 @@ private:
 			if (m_large.count(region.vaddr) != 0) {
 				// Large-page guest code stays read-write-execute: a large page cannot take a
 				// protection 16 KiB at a time. The guest-visible protection is kept separately.
-				if (mode != VirtualMemory::Mode::ExecuteReadWrite && !m_large_protect_logged) {
-					m_large_protect_logged = true;
+				if (mode != VirtualMemory::Mode::ExecuteReadWrite &&
+				    !m_large_protect_logged.exchange(true, std::memory_order_relaxed)) {
 					LOGF("Large pages: protection 0x%08" PRIx32 " at 0x%016" PRIx64
 					     " not applied to large-page guest code\n",
 					     static_cast<uint32_t>(mode), range_start);
@@ -1444,7 +1450,8 @@ private:
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
 		for (const auto& [guest_start, guest_end]: regions) {
-			auto next_addr = guest_start;
+			auto     next_addr       = guest_start;
+			uint32_t failed_attempts = 0;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
 				if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
@@ -1464,10 +1471,18 @@ private:
 					    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 					    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 					if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+						const DWORD error = GetLastError();
+						// Threads started before this one (Tracy's, with --profile) can map memory into
+						// the range between VirtualQuery and VirtualAlloc2: one Tracy start in five
+						// failed here. Query the same address again and reserve around the new mapping.
+						if (ptr == nullptr && ++failed_attempts < 64) {
+							continue;
+						}
 						EXIT("failed to reserve guest address space at 0x%016" PRIx64
-						     ", size 0x%016" PRIx64 "\n",
-						     reserve_start, reserve_end - reserve_start);
+						     ", size 0x%016" PRIx64 " (error %lu)\n",
+						     reserve_start, reserve_end - reserve_start, error);
 					}
+					failed_attempts = 0;
 					AddFreeUnlocked(reserve_start, reserve_end - reserve_start);
 					m_owned.emplace_back(reserve_start, reserve_end - reserve_start);
 				}
@@ -1701,7 +1716,7 @@ private:
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	// Private regions committed with large pages (start -> size); see GuestLargePageSize.
 	std::map<uint64_t, uint64_t>                m_large;
-	bool                                        m_large_protect_logged = false;
+	std::atomic<bool>                           m_large_protect_logged {false};
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;

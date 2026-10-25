@@ -170,6 +170,9 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// Any thread, no lock: an image may own a page-table page of the tracker pages the range
+	// touches (false: FindImagesInRegion with page_overlap finds none).
+	[[nodiscard]] bool          MayHaveImages(uint64_t address, uint64_t size) const noexcept;
 	// Drops cached FindImagesInRegion results that an image registered or unregistered over
 	// this range can change.
 	void                        InvalidateRegionQueries(uint64_t address, uint64_t size);
@@ -234,6 +237,10 @@ private:
 	uint32_t                                          m_texel_logs    = 0;
 	std::unordered_set<std::string>                   m_texel_log_seen;
 	ImagePageTable                                    m_image_page_table;
+	// One bit a page of m_image_page_table that has an owner: written under m_lock, read without
+	// it (MayHaveImages).
+	std::unique_ptr<std::atomic<uint64_t>[]> m_image_pages =
+	    std::make_unique<std::atomic<uint64_t>[]>(ImagePageTable::kPageCount / 64);
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

@@ -124,6 +124,9 @@ enum class Counter : uint32_t {
 	TaintIndirect,    // register-indirect pairs that could not be read cleanly
 	TaintContext,     // context-state pushes and pops the scanner could not follow
 	TaintRegister,    // SET_*_REG packets whose registers the GPU thread's handlers would reject
+	Resynced,         // taints ended by the GPU thread's registers (DrawPrepScanner::Resync)
+	ResyncPassed,     // resyncs not made: the GPU thread was already at or past the packet
+	ResyncTimeout,    // resyncs given up until the queue's next reset
 	Takes,            // GPU thread asked
 	Used,             // results used
 	Reused,           // results used again by a later draw of the same packet (multi-draw, retry)

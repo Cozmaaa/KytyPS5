@@ -85,6 +85,9 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	// The context-state push, for the draw-prep scanner's register copy (DrawPrepScanner::Resync).
+	[[nodiscard]] const HW::Context& GetSavedCtx() const { return m_saved_ctx; }
+	[[nodiscard]] bool               IsContextStatePushed() const { return m_context_state_pushed; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);

@@ -68,6 +68,8 @@ public:
 	// Only the ranges a draw's or dispatch's BDA loads can read (IR::EvaluateBdaReadPlan): their
 	// CPU-dirty buffers are synchronized. False when it cannot (PrepareBda then walks them all).
 	bool               PrepareBdaReadRanges(std::span<const GuestRange> ranges);
+	// KYTY_BDA_READ_PLAN=1: PrepareBdaReadRanges is used at all (off by default).
+	static bool        BdaReadPlansEnabled();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

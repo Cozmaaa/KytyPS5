@@ -121,6 +121,13 @@ public:
 	// Waits until the recording thread has run every queued command, and returns the command
 	// buffer it records into, for code that records directly.
 	vk::CommandBuffer DrainRecording();
+	// Full barriers: ones after which every earlier command is ordered before, and its writes are
+	// visible to, every later command (threaded recording only; KYTY_BARRIER_DEDUP=0 turns this
+	// off, per A/B arm). MarkSynchronized(command) right after recording one into the current
+	// command buffer; Synchronized(command) then holds while nothing has been recorded since, so
+	// another full barrier there would only repeat it.
+	void               MarkSynchronized(const CommandBuffer& command);
+	[[nodiscard]] bool Synchronized(const CommandBuffer& command) const;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -244,6 +251,12 @@ private:
 	uint64_t                            m_chunks_executed   = 0;
 	uint64_t                            m_drains            = 0;
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
+	// Where recording stood after the last full barrier (MarkSynchronized): the chunk, its last
+	// command, the chunks handed over by then and the tick.
+	const void*                         m_sync_chunk        = nullptr;
+	const void*                         m_sync_command      = nullptr;
+	uint64_t                            m_sync_dispatched   = 0;
+	uint64_t                            m_sync_tick         = 0;
 	uint64_t                            m_record_report_buffers = 0;
 	uint64_t                            m_record_report_chunks  = 0;
 	uint64_t                            m_record_report_drains  = 0;

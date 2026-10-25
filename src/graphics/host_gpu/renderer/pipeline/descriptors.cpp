@@ -792,8 +792,27 @@ bool TextureDescCacheEnabled() {
 
 } // namespace
 
+// A new binding of `id`, its description already in place, keeping the mip view storage.
+static void ResetTextureBinding(TextureBinding& binding, ImageId id) {
+	binding.image_id   = id;
+	binding.image_view = nullptr;
+	binding.layout     = vk::ImageLayout::eUndefined;
+	binding.mip_views.clear();
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureBinding binding;
+	ResolveTexture(binding, resource, value);
+	return binding;
+}
+
+// In place: an ImageDesc is ~570 bytes (sixteen mip layouts), and returning the binding copied it
+// three times per bound image of every draw (cached description -> parameter -> result -> the
+// prepared bindings), ~4,000 PrepareBindings a frame in UFC 5 fights.
+void RenderExecutor::ResolveTexture(TextureBinding&                              out,
+                                    const ShaderRecompiler::IR::ImageResource&   resource,
+                                    const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -805,10 +824,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		out.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                             : TextureCache::BindingType::Texture);
+		ResetTextureBinding(out, texture_cache.FindImage(out.desc));
+		return;
 	}
 
 	thread_local std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash> cache;
@@ -816,9 +835,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto key       = use_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
 	if (use_cache) {
 		if (const auto it = cache.find(key); it != cache.end()) {
-			return FindResolvedTexture(resource, descriptor, it->second.desc,
-			                           it->second.shader_conversion, it->second.pixel_format,
-			                           it->second.view_format, it->second.size);
+			FindResolvedTexture(out, resource, descriptor, it->second.desc,
+			                    it->second.shader_conversion, it->second.pixel_format,
+			                    it->second.view_format, it->second.size);
+			return;
 		}
 	}
 
@@ -942,10 +962,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 			     descriptor.fields[6], descriptor.fields[7]);
 		}
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		out.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                             : TextureCache::BindingType::Texture);
+		ResetTextureBinding(out, texture_cache.FindImage(out.desc));
+		return;
 	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
@@ -1009,19 +1029,21 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
 		                                     shader_conversion});
 	}
-	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
-	                           pixel_format, view_format, size.size);
+	FindResolvedTexture(out, resource, descriptor, desc, shader_conversion, pixel_format,
+	                    view_format, size.size);
 }
 
-// ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
-TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                                                   const ShaderTextureResource&               descriptor,
-                                                   TextureCache::ImageDesc desc,
-                                                   bool shader_conversion, vk::Format pixel_format,
-                                                   vk::Format view_format, uint32_t size) {
+// ResolveTexture's texture cache lookup for a description (FindImage may adjust out's copy).
+void RenderExecutor::FindResolvedTexture(TextureBinding&                            out,
+                                         const ShaderRecompiler::IR::ImageResource& resource,
+                                         const ShaderTextureResource&               descriptor,
+                                         const TextureCache::ImageDesc&             desc,
+                                         bool shader_conversion, vk::Format pixel_format,
+                                         vk::Format view_format, uint32_t size) {
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	out.desc                       = desc;
+	auto       id                  = texture_cache.FindImage(out.desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -1038,7 +1060,7 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	ResetTextureBinding(out, id);
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -2058,11 +2080,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto& binding = prepared.images[i];
+		ResolveTexture(binding, program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -2146,7 +2166,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			uint64_t size = 0;
 			{
-				KYTY_PROFILER_BLOCK("FindBuffers::ClampRangeSize");
+				KYTY_PROFILER_FINE_BLOCK("FindBuffers::ClampRangeSize");
 				size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
 			}
 			if (size == 0) {
@@ -2274,7 +2294,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				}
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			ResolveTexture(images[i], program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
@@ -2321,7 +2341,9 @@ void RenderExecutor::PrepareBdaBindings(std::span<PreparedBindings* const> stage
 		}
 		return hashes;
 	}();
-	bool bounded  = true;
+	// Without read plans (the default) PrepareBdaReadRanges refuses every range list, so the plans
+	// are not evaluated: two allocations and a sort for each BDA stage of every draw, thrown away.
+	bool bounded  = RenderContext::BdaReadPlansEnabled();
 	bool uses_dma = false;
 	m_bda_ranges.clear();
 	for (auto* stage: stages) {
@@ -2435,7 +2457,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		uint64_t                                descriptor_size    = 0;
 		bool                                    bounded  = false;
 	};
-	std::vector<WrittenRange> written_ranges;
+	// GPU thread only; kept between calls so a draw does not allocate it again (every draw with
+	// specialization reads gathers its render targets here).
+	static thread_local std::vector<WrittenRange> written_ranges;
+	written_ranges.clear();
 	bool                      written_gathered = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;

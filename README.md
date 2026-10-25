@@ -6,13 +6,49 @@
 > UFC 5-specific workarounds that are not meant for upstream. Report problems with this fork here,
 > not to the upstream project.
 
-**Credits** to [roshanarunk](https://github.com/roshanarunk) for finding some improvements.
+**Credits:**
+
+- [roshanarunk](https://github.com/roshanarunk), for finding some improvements.
+- [Senaxx](https://github.com/Senaxx), whose KytyPS5 fork brought the Vulkan recording thread, the
+  draw preparation scanner and the shader disk cache that this build is built on.
+- [EmK530](https://github.com/EmK530), for renderer optimizations that came in through Senaxx's
+  fork, such as batched GPU flushes.
+
+## This build
+
+- **Faster fights.** On CPUs with 8 or more cores, the GPU thread and the Vulkan recording thread
+  each get a physical core of their own. In A/B tests during fights this gave +3.6 % and +3.8 % fps.
+  The GPU thread also does less work per frame:
+  - memory-tracking faults are handled several pages at a time;
+  - page protection changes are grouped;
+  - unmaps download their data in the background;
+  - texture lookups skip memory that holds no images.
+
+  The emulator is built with ThinLTO and profile-guided optimization. To turn the core placement
+  off, set `KYTY_GPU_OWN_CORE=0` and `KYTY_RECORDING_OWN_CORE=0`.
+- **Fewer GPU stalls.** UFC 5 asks for about 1,300 full GPU barriers a frame, most of them right
+  after another, and each one made the host GPU wait for all earlier work. A barrier with nothing
+  recorded since the previous one is now skipped. In an A/B test during a fight this gave +8 % fps
+  (56.2 against 51.9). `KYTY_BARRIER_DEDUP=0` turns it off.
+- **Smoother frame pacing.** A frame that just misses a vblank is now shown half a vblank period
+  later instead of a whole one, so it waits about 8 ms instead of 17. Fights ran visibly faster,
+  at the right game speed. `KYTY_FLIP_LATCH_STEPS=1` turns it off.
+- **F9 turns UFC 5's FSR2 upscaler off and on**, for testing.
+  - With FSR2 off, the game's frame is stretched to the output with a plain linear filter. There
+    is no temporal anti-aliasing and no sharpening, so edges look rougher.
+  - In one test fight it ran about 5 % faster.
+  - Each press prints `F9: FSR2 off` or `F9: FSR2 on`. The next frame then prints the fps of the
+    time before the switch.
+  - `KYTY_FSR2_OFF=1` starts a run with FSR2 off.
 
 ## Known issues
 
-- **Random crashes** with `vkQueueSubmit failed: ErrorDeviceLost`, either early while loading or
-  later during play. On NVIDIA the Windows System event log shows "3D WIDTH ZT Violation" from
-  `nvlddmkm`: the game draws past the width of the depth buffer. This is not fixed yet.
+- **Device-lost crashes fixed.** These were `vkQueueSubmit failed: ErrorDeviceLost`, shown by
+  `nvlddmkm` as "3D WIDTH ZT Violation" in the Windows System event log.
+  - Cause: UFC 5's dynamic resolution widens the depth buffer, and the emulator kept drawing into
+    the old, narrower one.
+  - None have shown up since the fix.
+  - If you still get one, report it together with the `nvlddmkm` entry from the System event log.
 - **Black triangles** appear in some runs and not in others.
 - **Slow first launch.** The Vulkan pipeline cache is rebuilt for every new build, so the first run
   of a build loads slowly. Later runs are faster.

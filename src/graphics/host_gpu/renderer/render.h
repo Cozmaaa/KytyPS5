@@ -217,10 +217,12 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] TextureBinding FindResolvedTexture(
-	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
-	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
-	    vk::Format view_format, uint32_t size);
+	void ResolveTexture(TextureBinding& out, const ShaderRecompiler::IR::ImageResource& resource,
+	                    const ShaderRecompiler::IR::DescriptorValue& value);
+	void FindResolvedTexture(TextureBinding& out, const ShaderRecompiler::IR::ImageResource& resource,
+	                         const ShaderTextureResource& descriptor,
+	                         const TextureCache::ImageDesc& desc, bool shader_conversion,
+	                         vk::Format pixel_format, vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -303,6 +305,10 @@ private:
 // (partial flushes and cache events, which emit global barriers already, plus ACQUIRE_MEM and
 // WAIT_REG_MEM, which do then) order them, as on the hardware.
 [[nodiscard]] bool GuestSyncEnabled();
+
+// F9 without an in-run A/B (window.cpp): turns UFC 5's FSR2 off, or back on (renderCompute.cpp;
+// KYTY_FSR2_OFF=1 starts with it off). Any thread.
+void ToggleFsr2Bypass();
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

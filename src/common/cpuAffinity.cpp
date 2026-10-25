@@ -1,13 +1,18 @@
 #include "common/cpuAffinity.h"
 
+#include "common/abSwitch.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/ownCores.h"
+#include "common/profiler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -388,10 +393,33 @@ void InitCpuPlacement() {
 	});
 }
 
+// The critical and high threads, which ApplyOwnCores may move, with the CPU sets PlaceCurrentThread
+// gave them (empty: none, the process default applies).
+struct PlacedThread {
+	std::string           name;
+	HANDLE                handle = nullptr;
+	std::vector<uint32_t> ids;
+};
+static std::mutex                g_placed_mutex;
+static std::vector<PlacedThread> g_placed;
+static std::atomic<uint32_t>     g_placed_count {0};
+
+static void RememberCurrentThread(const char* name, const std::vector<uint32_t>& ids) {
+	HANDLE handle = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+	                    THREAD_SET_LIMITED_INFORMATION, FALSE, 0) == 0) {
+		return;
+	}
+	std::lock_guard lock(g_placed_mutex);
+	g_placed.push_back({name, handle, ids});
+	g_placed_count.fetch_add(1, std::memory_order_release);
+}
+
 void PlaceCurrentThread(ThreadClass cls, const char* name) {
+	Profiler::SetThreadName(name);
 	InitCpuPlacement();
 	auto& t = GetTopology();
-	if (!g_active || t.all.empty()) {
+	if (t.all.empty()) {
 		return;
 	}
 	if (GetMode() == Mode::Hybrid) {
@@ -399,10 +427,14 @@ void PlaceCurrentThread(ThreadClass cls, const char* name) {
 		if (cls != ThreadClass::Critical && cls != ThreadClass::High) {
 			return;
 		}
-		const bool ok = SetThreadSelectedCpuSets(GetCurrentThread(), reinterpret_cast<const ULONG*>(t.fast.data()),
-		                                         static_cast<ULONG>(t.fast.size())) != 0;
-		LOGF("CPU placement: %s on performance cores %s%s\n", name, FormatList(Numbers(t, t.fast)).c_str(),
-		     ok ? "" : " - failed");
+		if (g_active) {
+			const bool ok = SetThreadSelectedCpuSets(GetCurrentThread(), reinterpret_cast<const ULONG*>(t.fast.data()),
+			                                         static_cast<ULONG>(t.fast.size())) != 0;
+			LOGF("CPU placement: %s on performance cores %s%s\n", name, FormatList(Numbers(t, t.fast)).c_str(),
+			     ok ? "" : " - failed");
+		}
+		// After its own sets: ApplyOwnCores applies the own cores once it sees the thread.
+		RememberCurrentThread(name, g_active ? t.fast : std::vector<uint32_t> {});
 		return;
 	}
 	const std::vector<uint32_t>* ids = nullptr;
@@ -449,6 +481,141 @@ void PlaceCurrentThread(ThreadClass cls, const char* name) {
 	}
 	LOGF("CPU placement: %s (%s) on %s %s%s\n", name, ClassName(cls), where.c_str(),
 	     ids != nullptr ? FormatList(Numbers(t, *ids)).c_str() : "-", ok ? "" : " - failed");
+}
+
+// ufc57: in its busiest seconds every GPU-thread zone ran 10-40 % slower per call, trivial ones
+// too, while the game's threads were busier; as if the GPU thread shared its core with them.
+// ufc58, A/B on a 9800X3D with the GPU thread alone on logical processors 2-3: +3.6 % +-1.8 % fps.
+// ufc59, the Vulkan recording thread alone on 4-5 as well: +3.8 % +-2.5 %.
+static constexpr uint32_t kAutoCore = UINT32_MAX;
+
+// The default own cores, on CPUs with 8 or more cores: the fast core `index` (core 0 takes most
+// interrupts, so the GPU thread gets 1, the recording thread 2). None on smaller CPUs, whose cores
+// the guest's threads need. Returns its lowest logical processor number, or 0.
+static uint32_t AutoCore(const Topology& t, size_t index) {
+	std::set<uint32_t>           cores;
+	std::map<uint32_t, uint32_t> fast_cores; // core key -> its lowest logical processor number
+	for (const auto& lp: t.all) {
+		cores.insert(lp.core);
+		if (std::find(t.fast.begin(), t.fast.end(), lp.os_id) != t.fast.end()) {
+			const auto it = fast_cores.emplace(lp.core, lp.number).first;
+			it->second    = std::min(it->second, lp.number);
+		}
+	}
+	if (cores.size() < 8 || fast_cores.size() <= index) {
+		return 0;
+	}
+	return std::next(fast_cores.begin(), static_cast<ptrdiff_t>(index))->second;
+}
+
+static const LogicalProcessor* FindProcessor(const Topology& t, uint32_t number) {
+	const auto it = std::find_if(t.all.begin(), t.all.end(), [&](const LogicalProcessor& lp) {
+		return lp.number == number;
+	});
+	return it != t.all.end() ? &*it : nullptr;
+}
+
+void ApplyOwnCores() {
+	static const auto parse = [](const char* value) {
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	};
+	static const auto parse_auto = [](const char* value) {
+		return value != nullptr ? parse(value) : kAutoCore;
+	};
+	static const AbSwitch<uint32_t> gpu("KYTY_GPU_OWN_CORE", parse_auto);
+	static const AbSwitch<uint32_t> recording("KYTY_RECORDING_OWN_CORE", parse_auto);
+	static const AbSwitch<uint32_t> scanner("KYTY_SCANNER_OWN_CORE", parse);
+	static constexpr const char*    kThreads[] = {"GPU thread", "Vulkan recording thread",
+	                                              "draw preparation scanner"};
+	static constexpr const char*    kVariables[] = {"KYTY_GPU_OWN_CORE", "KYTY_RECORDING_OWN_CORE",
+	                                                "KYTY_SCANNER_OWN_CORE"};
+	// GPU thread only. Applied again when a critical or high thread starts, which takes the
+	// performance cores (hybrid rule) or the process default and may land on an own core.
+	static std::array<uint32_t, 3> applied {0, 0, 0};
+	static uint32_t                applied_threads = 0;
+	const std::array<uint32_t, 3>  wanted {gpu.Get(), recording.Get(), scanner.Get()};
+	const auto                     threads = g_placed_count.load(std::memory_order_acquire);
+	if (wanted == applied && threads == applied_threads) {
+		return;
+	}
+	const bool changed = wanted != applied;
+	applied            = wanted;
+	applied_threads    = threads;
+	auto& t            = GetTopology();
+	if (GetMode() != Mode::Hybrid || t.all.empty()) {
+		if (changed && std::any_of(wanted.begin(), wanted.end(),
+		                           [](uint32_t n) { return n != 0 && n != kAutoCore; })) {
+			LOGF("CPU placement: own cores ignored (%s)\n",
+			     t.all.empty() ? "no CPU set information" : "X3D mode places the threads");
+		}
+		return;
+	}
+	std::vector<uint32_t> core_ids[3];
+	std::set<uint32_t>    reserved;
+	for (size_t role = 0; role < 3; role++) {
+		const auto  number = wanted[role] == kAutoCore ? AutoCore(t, role + 1) : wanted[role];
+		const auto* chosen = FindProcessor(t, number);
+		if (number == 0 || chosen == nullptr) {
+			if (number != 0 && changed) {
+				LOGF("CPU placement: %s=%u: no such logical processor\n", kVariables[role], number);
+			}
+			continue;
+		}
+		for (const auto& lp: t.all) {
+			if (lp.core == chosen->core) {
+				core_ids[role].push_back(lp.os_id);
+				reserved.insert(lp.os_id);
+			}
+		}
+	}
+	std::vector<uint32_t> others;
+	for (const auto& lp: t.all) {
+		if (reserved.count(lp.os_id) == 0) {
+			others.push_back(lp.os_id);
+		}
+	}
+	// An empty set clears: no own core leaves no process default (every processor) and each thread
+	// with PlaceCurrentThread's sets.
+	const auto data = [](const std::vector<uint32_t>& ids) {
+		return ids.empty() ? nullptr : reinterpret_cast<const ULONG*>(ids.data());
+	};
+	const auto size = [](const std::vector<uint32_t>& ids) {
+		return static_cast<ULONG>(ids.size());
+	};
+	const auto& process_ids = reserved.empty() ? std::vector<uint32_t> {} : others;
+	bool ok =
+	    SetProcessDefaultCpuSets(GetCurrentProcess(), data(process_ids), size(process_ids)) != 0;
+	{
+		std::lock_guard lock(g_placed_mutex);
+		for (const auto& thread: g_placed) {
+			const auto role = std::find(std::begin(kThreads), std::end(kThreads), thread.name) -
+			                  std::begin(kThreads);
+			std::vector<uint32_t> ids;
+			if (role < 3 && !core_ids[role].empty()) {
+				ids = core_ids[role];
+			} else {
+				std::copy_if(thread.ids.begin(), thread.ids.end(), std::back_inserter(ids),
+				             [&](uint32_t id) { return reserved.count(id) == 0; });
+			}
+			ok = SetThreadSelectedCpuSets(thread.handle, data(ids), size(ids)) != 0 && ok;
+		}
+	}
+	if (!changed && ok) {
+		return;
+	}
+	std::string line;
+	for (size_t role = 0; role < 3; role++) {
+		if (!core_ids[role].empty()) {
+			line += (line.empty() ? "" : ", ") + std::string(kThreads[role]) + " alone on " +
+			        FormatList(Numbers(t, core_ids[role]));
+		}
+	}
+	line = line.empty() ? "no own cores"
+	                    : line + "; the others on " + FormatList(Numbers(t, others));
+	const char* failed = ok ? "" : " - failed";
+	LOGF("CPU placement: %s%s\n", line.c_str(), failed);
+	Profiler::Message(ok ? Profiler::MessageInfo : Profiler::MessageFailure, "CPU placement: %s%s",
+	                  line.c_str(), failed);
 }
 
 #else
@@ -534,6 +701,7 @@ void InitCpuPlacement() {
 }
 
 void PlaceCurrentThread(ThreadClass cls, const char* name) {
+	Profiler::SetThreadName(name);
 	InitCpuPlacement();
 	auto& t = GetTopology();
 	if (!g_active || t.all.empty()) {
@@ -559,12 +727,17 @@ void PlaceCurrentThread(ThreadClass cls, const char* name) {
 	     ok ? "" : " - failed");
 }
 
+void ApplyOwnCores() {}
+
 #endif
 
 #else
 
 void InitCpuPlacement() {}
-void PlaceCurrentThread(ThreadClass /*cls*/, const char* /*name*/) {}
+void PlaceCurrentThread(ThreadClass /*cls*/, const char* name) {
+	Profiler::SetThreadName(name);
+}
+void ApplyOwnCores() {}
 
 #endif
 

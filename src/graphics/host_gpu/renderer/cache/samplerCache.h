@@ -18,7 +18,7 @@ struct GraphicContext;
 
 class SamplerCache {
 public:
-	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {
+	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics), m_serial(NewSerial()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
 	~SamplerCache();
@@ -28,6 +28,10 @@ public:
 
 private:
 	using SamplerKey = std::array<uint32_t, 5>;
+
+	static uint32_t NewSerial();
+	vk::Sampler     FindOrCreate(const SamplerKey& key, const ShaderSamplerResource& r,
+	                             bool integer_border);
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {
@@ -42,6 +46,7 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
+	const uint32_t                                              m_serial;
 	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };

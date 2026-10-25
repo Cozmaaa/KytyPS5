@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostSampler.h"
 #include "common/logging/log.h"
+#include "common/ownCores.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -958,6 +959,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (breakdown) {
 			GpuBreakdown::Get().MaybeReport();
 		}
+		Common::ApplyOwnCores();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -1314,6 +1316,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			                      .seq     = execution.m_prep_seq,
 			                      .ordinal = execution.m_prep_ordinal - 1u,
 			                      .packet  = packet});
+			DrawPrepScanner::OfferRegisters(execution.m_prep_queue, execution.m_prep_seq,
+			                                execution.m_prep_ordinal - 1u, packet, *this);
 		}
 
 		if (GraphicsRunDebugDumpEnabled()) {
@@ -2000,6 +2004,22 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 
+	auto& scheduler = GetScheduler();
+	auto& command   = CurrentBuffer();
+	// Nothing recorded since the last full barrier: this one would only repeat it (the guest's
+	// sync macros ask for several in a row).
+	static uint64_t barriers = 0;
+	static uint64_t skipped  = 0;
+	if ((++barriers & 0xfffffu) == 0) {
+		LOGF("Full barriers: %" PRIu64 " of the last %u skipped (KYTY_BARRIER_DEDUP)\n", skipped,
+		     0x100000u);
+		skipped = 0;
+	}
+	if (scheduler.Synchronized(command)) {
+		skipped++;
+		return;
+	}
+
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
@@ -2009,8 +2029,9 @@ void CommandProcessor::EmitGlobalBarrier() {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
+	scheduler.EndRendering();
+	command.Recorder().pipelineBarrier2(dependency);
+	scheduler.MarkSynchronized(command);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

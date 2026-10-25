@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -394,19 +395,25 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
-	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
-	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
-	     "context %llu, register %llu); GPU takes %llu, "
-	     "used %llu (again %llu), miss none %llu / entry %llu / inputs %llu / reads %llu; verify "
-	     "%llu checks, "
-	     "%llu mismatches\n",
-	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
-	     c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
-	     c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
-	     c(Counter::TaintContext), c(Counter::TaintRegister), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
-	     c(Counter::Reused), c(Counter::MissNone), c(Counter::MissEntry), c(Counter::MissInputs),
-	     c(Counter::MissReads),
-	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
+	char       text[720];
+	snprintf(text, sizeof(text),
+	         "DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
+	         "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
+	         "context %llu, register %llu; resynced %llu, passed %llu, timed out %llu); GPU takes %llu, "
+	         "used %llu (again %llu), miss none %llu / entry %llu / inputs %llu / reads %llu; verify "
+	         "%llu checks, "
+	         "%llu mismatches",
+	         c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
+	         c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
+	         c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
+	         c(Counter::TaintContext), c(Counter::TaintRegister), c(Counter::Resynced),
+	         c(Counter::ResyncPassed), c(Counter::ResyncTimeout), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
+	         c(Counter::Reused), c(Counter::MissNone), c(Counter::MissEntry), c(Counter::MissInputs),
+	         c(Counter::MissReads),
+	         c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
+	LOGF("%s\n", text);
+	// Profile runs print nothing, so the counters also go to the capture's message list.
+	Profiler::Message(Profiler::MessageInfo, "%s", text);
 }
 
 void NoteGoodPair(uint64_t vs_addr, uint64_t ps_addr) {

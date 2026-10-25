@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -71,6 +72,40 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+
+	// What follows up to the image lookup depends only on the slot's registers and the slice
+	// offset, and a UFC 5 fight resolves ~4,800 color targets a frame from a handful of register
+	// states: the description is kept per slot while they are unchanged. The lookup still runs
+	// for every draw. KYTY_COLOR_TARGET_MEMO=0 turns this off.
+	struct Memo {
+		HW::RenderTarget                rt;
+		uint32_t                        slice_offset = 0;
+		bool                            valid        = false;
+		TextureCache::ImageDesc         desc;
+		uint32_t                        guest_mip_level   = 0;
+		uint32_t                        guest_array_layer = 0;
+		Prospero::ColorComponentMapping export_mapping;
+	};
+	static const bool memo_enabled = [] {
+		const char* value = std::getenv("KYTY_COLOR_TARGET_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	thread_local std::array<Memo, 8> memos {};
+	auto& texture_cache = m_context.GetTextureCache();
+	Memo* memo = memo_enabled && !graphics_debug_dump_enabled() && rt_slot < memos.size()
+	                 ? &memos[rt_slot]
+	                 : nullptr;
+	if (memo != nullptr && memo->valid && memo->slice_offset == render_target_slice_offset &&
+	    memo->rt == rt) {
+		r.desc              = memo->desc;
+		r.guest_mip_level   = memo->guest_mip_level;
+		r.guest_array_layer = memo->guest_array_layer;
+		r.export_mapping    = memo->export_mapping;
+		r.image_id          = texture_cache.FindImage(r.desc, exact_format);
+		BindRenderTarget(r.image_id);
+		return;
+	}
+
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
@@ -336,11 +371,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	if (memo != nullptr) {
+		// Before FindImage, which can move the view into a larger image.
+		*memo = {rt, render_target_slice_offset, true, desc, r.guest_mip_level, r.guest_array_layer,
+		         r.export_mapping};
+	}
+	r.image_id = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

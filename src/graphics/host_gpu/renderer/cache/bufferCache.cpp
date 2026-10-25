@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -358,6 +359,22 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+uint64_t BufferCache::InvalidateWriteFault(uint64_t vaddr, uint64_t ahead_pages) {
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (ahead_pages == 0) {
+		InvalidateMemory(vaddr, 1);
+		return 0;
+	}
+	// A clean faulting page becomes CPU-dirty with the pages ahead in one state change, so one
+	// protection change: done separately, a fault that went ahead took 2.5 us against 1.1 us for
+	// one that did not (ufc52 median). A GPU-dirty page still flushes through InvalidateMemory.
+	if (const auto marked = m_memory_tracker.MarkCpuDirtyAhead(page, ahead_pages + 1); marked != 0) {
+		return marked - 1;
+	}
+	InvalidateMemory(vaddr, 1);
+	return m_memory_tracker.MarkCpuDirtyAhead(page + TRACKER_PAGE_SIZE, ahead_pages);
+}
+
 bool BufferCache::WriteClean(uint64_t vaddr, const void* source, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
@@ -649,7 +666,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_FINE_FUNCTION();
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -831,19 +848,22 @@ std::pair<uint64_t, uint64_t> BufferCache::SyncUploads() const {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	KYTY_PROFILER_FUNCTION();
+	// Fine zones (KYTY_PROFILE_FINE=1): ~22,000 calls a frame in a UFC 5 fight, nearly all of them
+	// clean ranges of a few tens of nanoseconds; the copies keep their zones (Sync::Upload, ...).
+	KYTY_PROFILER_FINE_FUNCTION();
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
-	// times the tracker walk only with KYTY_SYNC_STATS=1.
-	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
-	Common::Timer               walk_timer;
+	// times the tracker walk only with KYTY_SYNC_STATS=1. The timer is only constructed then: its
+	// constructor queries the counter frequency (~24,000 calls a frame in a UFC 5 fight).
+	static const bool            timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
+	std::optional<Common::Timer> walk_timer;
 	if (timed) {
-		walk_timer.Start();
+		walk_timer.emplace().Start();
 	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	{
-		KYTY_PROFILER_BLOCK("Sync::Tracker");
+		KYTY_PROFILER_FINE_BLOCK("Sync::Tracker");
 		m_memory_tracker.ForEachUploadRange(
 		    vaddr, size, is_written,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -851,12 +871,31 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			    total_size += bytes;
 		    },
 		    [&]() noexcept {
+			    // Most calls have nothing to upload: their zone would only time the zone itself
+			    // (~18,500 a frame in a UFC 5 fight).
+			    if (copies.empty()) {
+				    return;
+			    }
 			    KYTY_PROFILER_BLOCK("Sync::Upload");
 			    source = UploadCopies(buffer, copies, total_size);
 		    });
 	}
-	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
-	if (source && m_sync_batching) {
+	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer->GetTimeS() : 0.0);
+	if (source) {
+		RecordSyncCopies(buffer, source, copies);
+	}
+	if (is_texel_buffer && !is_written) {
+		KYTY_PROFILER_FINE_BLOCK("Sync::TexelImage");
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
+// The copies of an upload from staging `source` into the buffer: with the sync batch's others
+// (FlushSyncBatch), or now, each with its own barriers.
+void BufferCache::RecordSyncCopies(Buffer& buffer, vk::Buffer source,
+                                   std::span<const vk::BufferCopy> copies) {
+	if (m_sync_batching) {
 		// SyncBatch: recorded with the batch's other copies (FlushSyncBatch). Their staging is
 		// watched by the recording they were made in; one submitted mid-walk (a staging ring wrap
 		// within the walk) would let it be reused before the copies run, so it is reported.
@@ -871,7 +910,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                        static_cast<uint32_t>(m_sync_batch_copies.size()),
 		                        static_cast<uint32_t>(copies.size())});
 		m_sync_batch_copies.insert(m_sync_batch_copies.end(), copies.begin(), copies.end());
-	} else if (source) {
+	} else {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -898,11 +937,39 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		KYTY_PROFILER_BLOCK("Sync::TexelImage");
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+}
+
+// What SynchronizeBuffer(buffer, span, read-only) does for each walk span, with one protection
+// pass per tracker region for all the spans in it (MemoryTracker::ClearCpuDirtySpans), then the
+// uploads. Re-protecting each span on its own made a host call per buffer piece of a dirty run:
+// with ~1,100 write faults a frame in UFC 5 fights (ufc56), the walks' protection changes were
+// ~0.75 ms a frame more than with ~360 (ufc55).
+void BufferCache::SynchronizeWalkSpans() {
+	m_walk_copies.clear();
+	m_memory_tracker.ClearCpuDirtySpans(m_walk_spans, [this](size_t index, uint64_t address,
+	                                                         uint64_t bytes) noexcept {
+		auto& span = m_walk_spans[index];
+		if (span.copy_count == 0) {
+			span.first_copy = static_cast<uint32_t>(m_walk_copies.size());
+		}
+		m_walk_copies.emplace_back(span.copy_bytes, m_slot_buffers[span.id].Offset(address), bytes);
+		span.copy_bytes += bytes;
+		span.copy_count++;
+	});
+	for (const auto& span: m_walk_spans) {
+		auto&      buffer = m_slot_buffers[span.id];
+		vk::Buffer source;
+		if (span.copy_count != 0) {
+			KYTY_PROFILER_BLOCK("Sync::Upload");
+			source = UploadCopies(buffer, std::span(m_walk_copies).subspan(span.first_copy, span.copy_count),
+			                      span.copy_bytes);
+		}
+		RecordSync(span.end - span.begin, false, static_cast<bool>(source), 0.0);
+		if (source) {
+			RecordSyncCopies(buffer, source,
+			                 std::span(m_walk_copies).subspan(span.first_copy, span.copy_count));
+		}
 	}
-	return false;
 }
 
 // A walk over many buffers (RenderContext::PrepareBda) records their uploads together: one end of
@@ -1452,6 +1519,7 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 		m_known_fills.clear();
 	}
 	m_known_fills.emplace(vaddr, std::pair {vaddr + size, value});
+	m_known_fills_generation.fetch_add(1, std::memory_order_release);
 }
 
 void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
@@ -1460,6 +1528,26 @@ void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
 	}
 	std::unique_lock lock(m_dirty_ranges_mutex);
 	EraseKnownFillsLocked(vaddr, size);
+}
+
+// Every bound render target and depth target of every draw came here (CommitGpuWrite): an
+// exclusive lock and two map searches, ~7,000 a frame in UFC 5 fights, for ranges that held
+// nothing since the previous draw. KYTY_FORGET_FILLS_MEMO=0 turns the skip off.
+void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size, uint64_t& generation) {
+	static const bool memo_enabled = [] {
+		const char* value = std::getenv("KYTY_FORGET_FILLS_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (size == 0) {
+		return;
+	}
+	if (memo_enabled && generation != 0 &&
+	    generation == m_known_fills_generation.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	EraseKnownFillsLocked(vaddr, size);
+	generation = m_known_fills_generation.load(std::memory_order_relaxed);
 }
 
 void BufferCache::MarkClearChecked(uint64_t vaddr, uint64_t size) {
@@ -1471,6 +1559,7 @@ void BufferCache::MarkClearChecked(uint64_t vaddr, uint64_t size) {
 		m_clear_checked.clear();
 	}
 	m_clear_checked[vaddr] = std::max(m_clear_checked[vaddr], vaddr + size);
+	m_known_fills_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool BufferCache::IsClearChecked(uint64_t vaddr, uint64_t size) {
@@ -1627,6 +1716,30 @@ void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+uint64_t BufferCache::DownloadBeforeUnmap(uint64_t vaddr, uint64_t size) {
+	bool downloaded = false;
+	auto it         = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto begin  = std::max(vaddr, buffer.CpuAddress());
+		const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
+		if (begin < end && DownloadBufferMemory<true>(buffer, begin, end - begin)) {
+			downloaded = true;
+		}
+	}
+	if (downloaded) {
+		// The last copy's tick, flushed, as in ReadMemoryStep.
+		m_last_async_download_tick = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+		return m_last_async_download_tick;
+	}
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_downloading_ranges.Intersects(vaddr, size) ? m_last_async_download_tick : 0;
+}
+
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	return !m_gpu_modified_ranges.Intersects(vaddr, size) &&
@@ -1640,6 +1753,23 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
+
+namespace {
+// Buffers that KYTY_HOST_BUFFER_MB placed in system memory cost no video memory, and the one
+// such a title has is its whole heap (2.7 GB): collecting it downloads it when the GPU wrote
+// to it, a drain of ~100 ms, and the next draw uploads all of it again. They stay unless
+// KYTY_GC_HOST_BUFFERS=1.
+bool KeptOutOfCollection(const Buffer& buffer) {
+	static const uint64_t host_bytes = []() -> uint64_t {
+		if (std::getenv("KYTY_GC_HOST_BUFFERS") != nullptr) {
+			return uint64_t {0};
+		}
+		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	return host_bytes != 0 && buffer.Size() >= host_bytes;
+}
+} // namespace
 
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
@@ -1707,6 +1837,9 @@ void BufferCache::RunGarbageCollector() {
 		gc_visited++;
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
+			return false;
+		}
+		if (KeptOutOfCollection(buffer)) {
 			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
@@ -1843,10 +1976,18 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 				}
 			}
 		});
+		// KYTY_WALK_PROTECT_ONCE=0: a sync per span, each protecting its own pages, as before.
+		static const Common::AbSwitch<bool> protect_once("KYTY_WALK_PROTECT_ONCE", [](const char* value) {
+			return value == nullptr || value[0] != '0';
+		});
 		BeginSyncBatch();
-		for (const auto& span: m_walk_spans) {
-			(void)SynchronizeBuffer(m_slot_buffers[span.id], span.begin, span.end - span.begin, false,
-			                        false);
+		if (protect_once.Get()) {
+			SynchronizeWalkSpans();
+		} else {
+			for (const auto& span: m_walk_spans) {
+				(void)SynchronizeBuffer(m_slot_buffers[span.id], span.begin, span.end - span.begin,
+				                        false, false);
+			}
 		}
 		FlushSyncBatch();
 		return;

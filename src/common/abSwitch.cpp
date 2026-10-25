@@ -23,6 +23,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// The A/B's lines reach the console even in a run that silences the log (Run-Ufc5.ps1
+// -Performance): they are what the run is for.
+template <typename... Args>
+void AbLog(const char* format, Args&&... args) {
+	Log::WriteToConsoleAndLog(fmt::sprintf(format, std::forward<Args>(args)...));
+}
+
 struct Overrides {
 	std::vector<std::pair<std::string, std::optional<std::string>>> values;
 	bool                                                            enabled = false;
@@ -66,6 +73,7 @@ struct ArmTotals {
 	uint64_t            draws   = 0;
 	uint64_t            draw_ns = 0;
 	std::vector<double> block_fps;
+	std::vector<double> block_p95_ms; // 95th percentile of the block's frame intervals
 };
 
 // Present thread only, except the draw counters (GPU thread).
@@ -76,11 +84,31 @@ struct State {
 	bool                  started     = false;
 	bool                  first_frame = true;
 	Clock::time_point     first_frame_time;
+	Clock::time_point     last_frame;
 	uint32_t              block       = 0;
 	uint32_t              block_frame = 0;
 	Clock::time_point     measure_start;
+	std::vector<float>    intervals_ms; // the measured frames of the current block
 	std::array<ArmTotals, 2> arms;
 };
+
+// The q quantile of values, which it reorders.
+double Quantile(std::vector<float>& values, double q) {
+	if (values.empty()) {
+		return 0.0;
+	}
+	const auto k = std::min(static_cast<size_t>(q * static_cast<double>(values.size())), values.size() - 1);
+	std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(k), values.end());
+	return values[k];
+}
+
+double Mean(const std::vector<double>& values) {
+	double sum = 0.0;
+	for (const auto v: values) {
+		sum += v;
+	}
+	return values.empty() ? 0.0 : sum / static_cast<double>(values.size());
+}
 
 State& GetState() {
 	static State state;
@@ -125,12 +153,17 @@ void LogSummary(const State& state) {
 		                  var_b / static_cast<double>(b.block_fps.size())) /
 		        mean_a;
 	}
-	LOGF("AB summary: blocks A=%zu B=%zu fps A=%.2f B=%.2f B-vs-A=%+.1f%% +-%.1f%% draws/frame A=%.0f "
-	     "B=%.0f draw-us A=%.2f B=%.2f\n",
-	     a.block_fps.size(), b.block_fps.size(), fps(a), fps(b), delta, error, per_frame(a.draws, a),
-	     per_frame(b.draws, b),
-	     a.draws > 0 ? static_cast<double>(a.draw_ns) / static_cast<double>(a.draws) / 1000.0 : 0.0,
-	     b.draws > 0 ? static_cast<double>(b.draw_ns) / static_cast<double>(b.draws) / 1000.0 : 0.0);
+	// Draws are counted only with KYTY_TABLE_CENSUS (renderDraw.cpp).
+	const auto draws = a.draws + b.draws == 0
+	                       ? std::string {}
+	                       : fmt::sprintf(
+	                             " draws/frame A=%.0f B=%.0f draw-us A=%.2f B=%.2f", per_frame(a.draws, a),
+	                             per_frame(b.draws, b),
+	                             a.draws > 0 ? static_cast<double>(a.draw_ns) / static_cast<double>(a.draws) / 1000.0 : 0.0,
+	                             b.draws > 0 ? static_cast<double>(b.draw_ns) / static_cast<double>(b.draws) / 1000.0 : 0.0);
+	AbLog("AB summary: blocks A=%zu B=%zu fps A=%.2f B=%.2f B-vs-A=%+.1f%% +-%.1f%% p95-ms A=%.1f B=%.1f%s\n",
+	     a.block_fps.size(), b.block_fps.size(), fps(a), fps(b), delta, error, Mean(a.block_p95_ms),
+	     Mean(b.block_p95_ms), draws.c_str());
 }
 
 } // namespace
@@ -174,6 +207,7 @@ void AbOnFrame() {
 	static const uint32_t start_seconds = EnvNumber("KYTY_AB_START", 0);
 	auto&                 state         = GetState();
 	const auto            now           = Clock::now();
+	const auto            interval      = now - std::exchange(state.last_frame, now);
 	if (state.first_frame) {
 		state.first_frame      = false;
 		state.first_frame_time = now;
@@ -181,7 +215,7 @@ void AbOnFrame() {
 		for (const auto& [key, value]: GetOverrides().values) {
 			spec += " " + key + "=" + value.value_or("<unset>");
 		}
-		LOGF("AB: B arm%s; blocks of %u frames, %u warm-up\n", spec.c_str(), block_frames, warmup_frames);
+		AbLog("AB: B arm%s; blocks of %u frames, %u warm-up\n", spec.c_str(), block_frames, warmup_frames);
 	}
 	if (!state.started) {
 		const bool timed = start_seconds > 0 && now - state.first_frame_time >= std::chrono::seconds(start_seconds);
@@ -192,15 +226,19 @@ void AbOnFrame() {
 		state.block       = 0;
 		state.block_frame = 0;
 		AbDetail::g_arm.store(ArmOfBlock(0), std::memory_order_relaxed);
-		LOGF("AB: started\n");
+		AbLog("AB: started\n");
 		return;
 	}
 	state.block_frame++;
 	if (state.block_frame == warmup_frames) {
 		state.measure_start = now;
+		state.intervals_ms.clear();
 		state.draws.store(0, std::memory_order_relaxed);
 		state.draw_ns.store(0, std::memory_order_relaxed);
 		return;
+	}
+	if (state.block_frame > warmup_frames) {
+		state.intervals_ms.push_back(std::chrono::duration<float, std::milli>(interval).count());
 	}
 	if (state.block_frame < block_frames) {
 		return;
@@ -216,9 +254,13 @@ void AbOnFrame() {
 	totals.draws += draws;
 	totals.draw_ns += draw_ns;
 	totals.block_fps.push_back(seconds > 0.0 ? static_cast<double>(frames) / seconds : 0.0);
-	LOGF("AB block %u: arm %c fps %.2f draws/frame %.0f draw-us %.2f\n", state.block, arm == 0 ? 'A' : 'B',
-	     totals.block_fps.back(), static_cast<double>(draws) / static_cast<double>(frames),
-	     draws > 0 ? static_cast<double>(draw_ns) / static_cast<double>(draws) / 1000.0 : 0.0);
+	totals.block_p95_ms.push_back(Quantile(state.intervals_ms, 0.95));
+	const auto draw_text = draws == 0 ? std::string {}
+	                                  : fmt::sprintf(" draws/frame %.0f draw-us %.2f",
+	                                                 static_cast<double>(draws) / static_cast<double>(frames),
+	                                                 static_cast<double>(draw_ns) / static_cast<double>(draws) / 1000.0);
+	AbLog("AB block %u: arm %c fps %.2f p95-ms %.1f%s\n", state.block, arm == 0 ? 'A' : 'B',
+	     totals.block_fps.back(), totals.block_p95_ms.back(), draw_text.c_str());
 	LogSummary(state);
 	state.block++;
 	state.block_frame = 0;

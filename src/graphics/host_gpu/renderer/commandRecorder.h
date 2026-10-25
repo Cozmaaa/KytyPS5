@@ -265,6 +265,14 @@ public:
 			                     &region);
 		});
 	}
+	void blitImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
+	               vk::ImageLayout destination_layout, const vk::ImageBlit& region,
+	               vk::Filter filter) const {
+		Run([=](vk::CommandBuffer command) {
+			command.blitImage(source, source_layout, destination, destination_layout, 1, &region,
+			                  filter);
+		});
+	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
 		if (!Threaded()) {

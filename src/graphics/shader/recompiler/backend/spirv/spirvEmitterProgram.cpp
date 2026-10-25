@@ -245,9 +245,13 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
-		// Both operations already combine both emulated halves into one whole-wave result.
+	using Op      = IR::ValueOpcode;
+	const auto op = inst.GetOpcode();
+	if (ctx.half != 0 &&
+	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::ReadConstBuffer ||
+	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
+		// Whole-wave results, and SMEM loads (SGPR operands, no EXEC), are the same in both
+		// emulated halves, so the second half reuses the first's (upstream 8cc5f536).
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}

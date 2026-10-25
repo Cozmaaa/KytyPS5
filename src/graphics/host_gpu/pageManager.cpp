@@ -3,6 +3,7 @@
 #include "common/abSwitch.h"
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -196,7 +197,7 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		const bool stats = ProtectStatsEnabled();
+		const bool stats = ProtectStatsEnabled() || Profiler::g_counters;
 		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
@@ -209,9 +210,10 @@ struct PageManager::Impl {
 		}
 	}
 
-	// Diagnostics (KYTY_PROTECT_STATS=1): protection changes, split by direction (a downgrade
-	// that takes write access away, an upgrade that gives it back) and by thread (the GPU thread or
-	// another, a write fault's), logged every 2 s.
+	// Diagnostics (KYTY_PROTECT_STATS=1, and Tracy messages with --profile): protection changes,
+	// split by direction (a downgrade that takes write access away, an upgrade that gives it back)
+	// and by thread (the GPU thread or another, a write fault's), logged every 2 s. (Not Tracy
+	// counters: profiler.h is among the files that key the shader disk cache.)
 	static bool ProtectStatsEnabled() {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_PROTECT_STATS");
@@ -264,7 +266,10 @@ struct PageManager::Impl {
 			              static_cast<double>(spent) / seconds / 1e6);
 			line += part;
 		}
-		std::printf("%s\n", line.c_str());
+		if (ProtectStatsEnabled()) {
+			std::printf("%s\n", line.c_str());
+		}
+		Profiler::Message(Profiler::MessageInfo, "%s", line.c_str());
 	}
 
 	// A protection change covers a run of pages whose protection changes, extended over pages

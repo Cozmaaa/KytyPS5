@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -468,8 +469,14 @@ public:
 		return m_coverage_generation.load(std::memory_order_acquire);
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	// `span`, when given, receives the committed span holding virtual_addr ({0, 0} if there is
+	// none or the ranges were walked).
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size,
+	                        std::pair<uint64_t, uint64_t>* span_out = nullptr) {
 		Common::LockGuard lock(m_mutex);
+		if (span_out != nullptr) {
+			*span_out = {0, 0};
+		}
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -496,7 +503,13 @@ public:
 				return 0;
 			}
 			--span;
-			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+			if (virtual_addr >= span->end) {
+				return 0;
+			}
+			if (span_out != nullptr) {
+				*span_out = {span->start, span->end};
+			}
+			return std::min(size, span->end - virtual_addr);
 		}
 
 		auto vma = FindContaining(virtual_addr);
@@ -1044,13 +1057,38 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 		return value == nullptr || value[0] != '0';
 	}();
 	thread_local std::array<Answer, 64> answers {};
+	// The committed spans recent answers came from: UFC 5's per-draw constants are ~17,000
+	// distinct ranges a frame, too many for the answers above, but they lie in a few large spans,
+	// and a range wholly inside one is committed in full (what the lookup below would return).
+	struct KnownSpan {
+		uint64_t generation = 0;
+		uint64_t start      = 0;
+		uint64_t end        = 0;
+	};
+	thread_local std::array<KnownSpan, 8> spans {};
+	thread_local uint32_t                 span_next = 0;
 	const auto generation = g_virtual_ranges->CoverageGeneration();
+	if (cached && vaddr != 0 && size != 0) {
+		for (const auto& known: spans) {
+			if (known.generation == generation && vaddr >= known.start && vaddr < known.end &&
+			    size <= known.end - vaddr) {
+				return size;
+			}
+		}
+	}
 	auto&      answer     = answers[((vaddr >> 12u) ^ (size >> 12u) ^ size) & 63u];
 	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
 		return answer.clamped;
 	}
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	std::pair<uint64_t, uint64_t> span {};
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, &span);
 	answer                  = {generation, vaddr, size, clamped_size};
+	if (cached && span.second > span.first &&
+	    std::ranges::none_of(spans, [&](const KnownSpan& known) {
+		    return known.generation == generation && known.start == span.first;
+	    })) {
+		spans[span_next++ % spans.size()] = {generation, span.first, span.second};
+	}
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",

@@ -192,6 +192,17 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 					ToggleDesktopFullscreen();
 				}
 				break;
+			case SDLK_F9:
+				// Starts an in-run A/B (common/abSwitch.h; KYTY_AB_B), e.g. once a fight starts.
+				// Without one, turns FSR2 off and on.
+				if (!key.repeat) {
+					if (Common::AbEnabled()) {
+						Common::AbStart();
+					} else {
+						ToggleFsr2Bypass();
+					}
+				}
+				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & SDL_KMOD_ALT) != 0) {

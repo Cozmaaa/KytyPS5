@@ -28,12 +28,14 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -46,7 +48,9 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
@@ -260,7 +264,254 @@ private:
 	std::vector<Saved> m_saved;
 };
 
+// Diagnostics: UFC 5's FSR 2.0.1 upscaler off. F9 turns it off and on (ToggleFsr2Bypass) when no
+// A/B is set up, and logs the fps of the time before; KYTY_FSR2_OFF=1 starts with it off, and as an
+// A/B switch KYTY_AB_B="KYTY_FSR2_OFF=1" compares it in blocks. Its passes are known by their guest
+// shader hashes. Prepare-input's colour is remembered, the passes up to RCAS are dropped, and RCAS
+// becomes a linear blit of that colour (the render size from cbFSR2) onto RCAS's output: no
+// temporal AA and no sharpening. FSR2's output is in the input's scale (the pre-exposure it
+// multiplies in, it divides out again), so the colours stay. Its history restarts when it comes
+// back on. A blit the device or the images cannot do turns the bypass off for the rest of the run.
+enum class Fsr2Pass { None, PrepareInput, Skipped, Rcas };
+
+Fsr2Pass Fsr2PassOf(uint64_t hash) {
+	switch (hash) {
+		case 0x0c399ab0b1e7fa33: return Fsr2Pass::PrepareInput;
+		case 0x1a19faa210398edd: // luminance pyramid
+		case 0x9c12c7c42d99d8d5: // reconstruct previous depth
+		case 0x2c0ffe3405ce2583: // depth clip
+		case 0xe653a2b73ebf94c9: // lock
+		case 0xe17349e0d437757b: // accumulate
+			return Fsr2Pass::Skipped;
+		case 0x3c6058d66788f544: return Fsr2Pass::Rcas;
+		default: return Fsr2Pass::None;
+	}
+}
+
+// GPU thread only.
+struct Fsr2Bypass {
+	ImageId   input;
+	vk::Image input_handle  = nullptr;
+	uint64_t  input_address = 0;
+	uint32_t  input_level   = 0;
+	uint32_t  input_layer   = 0;
+	bool      unsupported   = false;
+	bool      logged        = false;
+	// The setting this frame's passes follow, latched at prepare-input, and the FSR2 frames and
+	// time since it last changed.
+	bool                                  active  = false;
+	bool                                  started = false;
+	uint64_t                              frames  = 0;
+	std::chrono::steady_clock::time_point since;
+};
+
+Fsr2Bypass& Fsr2State() {
+	static Fsr2Bypass state;
+	return state;
+}
+
+// F9 presses (ToggleFsr2Bypass); an odd count flips KYTY_FSR2_OFF.
+std::atomic<uint32_t> g_fsr2_toggles {0};
+
+bool Fsr2BypassWanted() {
+	static const Common::AbSwitch<bool> enabled("KYTY_FSR2_OFF", [](const char* value) {
+		return value != nullptr && value[0] == '1';
+	});
+	return enabled.Get() != ((g_fsr2_toggles.load(std::memory_order_relaxed) & 1u) != 0);
+}
+
+bool Fsr2BypassEnabled() {
+	const auto& state = Fsr2State();
+	return state.active && !state.unsupported;
+}
+
+// Once a frame, at prepare-input: a change of setting applies to whole frames.
+void Fsr2Latch() {
+	auto&      state = Fsr2State();
+	const auto now   = std::chrono::steady_clock::now();
+	const bool want  = Fsr2BypassWanted() && !state.unsupported;
+	if (!state.started) {
+		state.started = true;
+		state.active  = want;
+		state.since   = now;
+	} else if (want != state.active) {
+		const double seconds = std::chrono::duration<double>(now - state.since).count();
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "FSR2 {} now; with it {}: {:.1f} s at {:.1f} fps\n", want ? "off" : "on",
+		    state.active ? "off" : "on", seconds,
+		    seconds > 0.0 ? static_cast<double>(state.frames) / seconds : 0.0));
+		state.active = want;
+		state.frames = 0;
+		state.since  = now;
+	}
+	state.frames++;
+}
+
+// Prepare-input's colour: the sampled image it never writes that is not the 1x1 exposure.
+// find_image is TextureCache::m_slot_images.try_get, which only RenderExecutor may call.
+template <typename FindImage>
+void Fsr2CaptureInput(const FindImage& find_image,
+                      const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                      const PreparedBindings&                         bindings) {
+	auto& state = Fsr2State();
+	state.input = {};
+	for (size_t i = 0; i < program.info.images.size(); i++) {
+		const auto& resource = program.info.images[i];
+		const auto& binding  = bindings.images[i];
+		if (resource.written ||
+		    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+			continue;
+		}
+		const Image* image = find_image(binding.image_id);
+		if (image == nullptr || image->backing.image == nullptr || image->info.data.Empty() ||
+		    (image->backing.extent.width <= 1 && image->backing.extent.height <= 1)) {
+			continue;
+		}
+		// Bound for writing as well (FSR2's luma history).
+		bool written = false;
+		for (size_t j = 0; j < program.info.images.size(); j++) {
+			written |= program.info.images[j].written && bindings.images[j].image_id == binding.image_id;
+		}
+		if (written) {
+			continue;
+		}
+		state.input         = binding.image_id;
+		state.input_handle  = image->backing.image;
+		state.input_address = image->info.data.address;
+		state.input_level   = binding.desc.view_info.base_level;
+		state.input_layer   = binding.desc.view_info.base_layer;
+		return;
+	}
+}
+
+// RCAS as a blit of the remembered colour onto its output; false runs RCAS.
+template <typename FindImage>
+bool Fsr2ReplaceRcas(RenderContext& context, CommandBuffer& buffer, const FindImage& find_image,
+                     const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                     const PreparedBindings&                         bindings) {
+	auto&      state = Fsr2State();
+	const auto input = std::exchange(state.input, ImageId {});
+	if (!Fsr2BypassEnabled() || !input) {
+		return false;
+	}
+	const auto refuse = [&](const std::string& reason) {
+		state.unsupported = true;
+		Log::WriteToConsoleAndLog("FSR2 bypass: off for this run, " + reason + "\n");
+		return false;
+	};
+	Image* source = find_image(input);
+	if (source == nullptr || !source->registered || source->backing.image != state.input_handle ||
+	    source->info.data.address != state.input_address) {
+		return false;
+	}
+	const TextureBinding* output = nullptr;
+	for (size_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].written) {
+			if (output != nullptr) {
+				return refuse("RCAS writes more than one image");
+			}
+			output = &bindings.images[i];
+		}
+	}
+	if (output == nullptr) {
+		return refuse("RCAS writes no image");
+	}
+	Image* destination = find_image(output->image_id);
+	if (destination == nullptr || destination->backing.image == nullptr ||
+	    output->image_id == input) {
+		return refuse("RCAS's output has no host image");
+	}
+	const auto& graphics   = context.GetGraphics();
+	const auto  blittable  = [&](const Image& image, vk::FormatFeatureFlags features) {
+		const std::string_view numeric = vk::componentNumericFormat(image.backing.format, 0);
+		return image.backing.image_type == vk::ImageType::e2D && image.backing.samples == 1 &&
+		       !image.info.IsDepth() && numeric != "UINT" && numeric != "SINT" &&
+		       (graphics.GetFormatProperties(image.backing.format).optimalTilingFeatures &
+		        features) == features;
+	};
+	if (!blittable(*source, vk::FormatFeatureFlagBits::eBlitSrc |
+	                            vk::FormatFeatureFlagBits::eSampledImageFilterLinear) ||
+	    !blittable(*destination, vk::FormatFeatureFlagBits::eBlitDst) ||
+	    !(source->backing.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+	    !(destination->backing.usage & vk::ImageUsageFlagBits::eTransferDst)) {
+		return refuse(fmt::format("no blit from {} to {}", vk::to_string(source->backing.format),
+		                          vk::to_string(destination->backing.format)));
+	}
+	const auto& view = output->desc.view_info;
+	if (state.input_level >= source->backing.mip_levels ||
+	    state.input_layer >= source->backing.layers ||
+	    view.base_level >= destination->backing.mip_levels ||
+	    view.base_layer >= destination->backing.layers) {
+		return refuse("a view outside its image");
+	}
+	const uint32_t source_width  = std::max(1u, source->backing.extent.width >> state.input_level);
+	const uint32_t source_height = std::max(1u, source->backing.extent.height >> state.input_level);
+	const uint32_t width  = std::max(1u, destination->backing.extent.width >> view.base_level);
+	const uint32_t height = std::max(1u, destination->backing.extent.height >> view.base_level);
+	// cbFSR2 starts with iRenderSize and iDisplaySize; without it, the whole input.
+	uint32_t render_width  = source_width;
+	uint32_t render_height = source_height;
+	bool     from_constants = false;
+	for (const auto& constants: bindings.buffer_sources) {
+		std::array<uint32_t, 4> words {};
+		if (constants.address == 0 || constants.size < sizeof(words) ||
+		    context.GetBufferCache().HasGpuDirtyBytes(constants.address, sizeof(words)) ||
+		    !Libs::LibKernel::Memory::TryReadBacking(constants.address, words.data(),
+		                                             sizeof(words))) {
+			continue;
+		}
+		if (words[2] == width && words[3] == height && words[0] != 0 &&
+		    words[0] <= source_width && words[1] != 0 && words[1] <= source_height) {
+			render_width   = words[0];
+			render_height  = words[1];
+			from_constants = true;
+			break;
+		}
+	}
+	const auto                  command = buffer.Recorder();
+	const ImageSubresourceRange source_range {state.input_level, 1, state.input_layer, 1};
+	const ImageSubresourceRange destination_range {view.base_level, 1, view.base_layer, 1};
+	source->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	                source_range, command);
+	destination->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                     destination_range, command);
+	vk::ImageBlit region {};
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, state.input_level, state.input_layer, 1};
+	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(render_width),
+	                                      static_cast<int32_t>(render_height), 1};
+	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, view.base_level, view.base_layer, 1};
+	region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+	const auto gpu_zone = BeginGpuZone(context, buffer, program.shader_hash);
+	command.blitImage(source->backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                  destination->backing.image, vk::ImageLayout::eTransferDstOptimal, region,
+	                  vk::Filter::eLinear);
+	GpuProfiler::End(buffer, gpu_zone);
+	destination->Transit(vk::ImageLayout::eGeneral,
+	                     vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+	                     destination_range, command);
+	if (source->binding.is_target &&
+	    source->binding.attachment_layout != vk::ImageLayout::eUndefined) {
+		source->Transit(source->binding.attachment_layout,
+		                source->binding.attachment_access | vk::AccessFlagBits2::eShaderRead, {},
+		                command);
+	}
+	if (!state.logged) {
+		state.logged = true;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "FSR2 bypass: RCAS replaced by a blit of {} {}x{} ({}x{}{}) onto {} {}x{}\n",
+		    vk::to_string(source->backing.format), source_width, source_height, render_width,
+		    render_height, from_constants ? " from cbFSR2" : ", no cbFSR2 found",
+		    vk::to_string(destination->backing.format), width, height));
+	}
+	return true;
+}
+
 } // namespace
+
+void ToggleFsr2Bypass() {
+	g_fsr2_toggles.fetch_add(1, std::memory_order_relaxed);
+	Log::WriteToConsoleAndLog(Fsr2BypassWanted() ? "F9: FSR2 off\n" : "F9: FSR2 on\n");
+}
 
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
@@ -556,6 +807,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	const auto  fsr2_pass = Fsr2PassOf(program.shader_hash);
+	if (fsr2_pass == Fsr2Pass::Skipped && Fsr2BypassEnabled()) {
+		ResetBindings();
+		return;
+	}
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
 		if (resources.specialization_reads.empty() &&
@@ -608,6 +864,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	if (fsr2_pass != Fsr2Pass::None) {
+		const auto find_image = [this](ImageId id) {
+			return m_context.GetTextureCache().m_slot_images.try_get(id);
+		};
+		if (fsr2_pass == Fsr2Pass::PrepareInput) {
+			Fsr2Latch();
+			Fsr2CaptureInput(find_image, program, bindings);
+			if (Fsr2BypassEnabled()) {
+				ResetBindings();
+				return;
+			}
+		} else if (fsr2_pass == Fsr2Pass::Rcas &&
+		           Fsr2ReplaceRcas(m_context, buffer, find_image, program, bindings)) {
+			ResetBindings();
+			return;
+		}
+	}
 
 	// Diagnostics: KYTY_LOG_CS_ADDR=<hex guest code address>: the first 64 dispatches of that
 	// compute shader with what they read and write (a device-lost hunt: a store to an invalid GPU

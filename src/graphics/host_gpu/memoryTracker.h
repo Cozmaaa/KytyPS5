@@ -84,6 +84,72 @@ public:
 			}
 		});
 	}
+	// Read-only uploads of many ranges at once (the BDA walk, BufferCache::SynchronizeWalkSpans):
+	// func(index, address, bytes) for each CPU-dirty range of spans[index] (members begin and end;
+	// address order, not overlapping), whose pages become clean and write-protected. A region is
+	// protected once for all of its spans, where an upload per span protected it once per span:
+	// the runs of neighbouring buffers merge into one host call (a TLB shootdown, ~2 us with the
+	// game's threads running). Every page is protected before this returns, so the caller reads
+	// guest memory after it. func must not call back into the tracker.
+	template <typename Spans, typename Func>
+	void ClearCpuDirtySpans(const Spans& spans, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Func&, size_t, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+		RegionManager* locked  = nullptr;
+		const auto     release = [&] {
+			if (locked != nullptr) {
+				locked->ProtectCleanCpuPages();
+				locked->lock.unlock();
+				locked = nullptr;
+			}
+		};
+		for (size_t index = 0; index < spans.size(); index++) {
+			const uint64_t begin = spans[index].begin;
+			Iterate<false>(begin, spans[index].end - begin,
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               // As the read-only walk of ForEachUploadRange: a clean summary is exact.
+				               if (!manager->MaybeModified<DirtySource::Cpu>()) {
+					               return;
+				               }
+				               if (manager != locked) {
+					               release();
+					               manager->lock.lock();
+					               locked = manager;
+				               }
+				               manager->ForEachModifiedRange<DirtySource::Cpu, true, false>(
+				                   manager->GetCpuAddr() + offset, bytes,
+				                   [&](uint64_t address, uint64_t run) noexcept { func(index, address, run); });
+			               });
+		}
+		release();
+	}
+	// Makes up to `pages` pages from vaddr on CPU-dirty, stopping at the first page that already is
+	// CPU- or GPU-dirty or in no region: a write fault's fault-ahead, for a game thread writing
+	// through memory page by page (BufferCache::InvalidateWriteFault). Returns the pages marked.
+	uint64_t MarkCpuDirtyAhead(uint64_t vaddr, uint64_t pages) noexcept {
+		CheckNotInUploadCallback();
+		uint64_t marked = 0;
+		while (pages != 0 && vaddr < TRACKER_ADDRESS_SIZE) {
+			auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				break;
+			}
+			const auto in_region =
+			    std::min<uint64_t>(pages, (TRACKER_REGION_SIZE - vaddr % TRACKER_REGION_SIZE) /
+			                                  TRACKER_PAGE_SIZE);
+			const auto run = [&] {
+				std::scoped_lock lock(manager->lock);
+				return manager->MarkCpuDirtyAhead(vaddr, static_cast<size_t>(in_region));
+			}();
+			marked += run;
+			if (run != in_region) {
+				break;
+			}
+			pages -= run;
+			vaddr += run * TRACKER_PAGE_SIZE;
+		}
+		return marked;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

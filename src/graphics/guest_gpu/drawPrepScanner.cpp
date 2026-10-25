@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/drawPrepScanner.h"
 
 #include "common/cpuAffinity.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -15,6 +16,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -26,7 +32,143 @@ bool IsGraphicsDraw(uint32_t opcode) {
 	       opcode != Pm4::IT_DISPATCH_INDIRECT;
 }
 
+// An indirect table that tainted a queue's register copy. A taint lasts until the queue's next
+// suspend point (UFC 5: one taint skipped 45-300 draws, 2026-10-24), so which tables fail, and why,
+// is in the log and the capture's messages: the first 48, then every 1024th.
+void ReportIndirectTaint(uint32_t queue, uint32_t opcode, uint64_t address, uint32_t count,
+                         const char* reason) {
+	static std::atomic<uint32_t> reported {0};
+	const auto                   n = reported.fetch_add(1, std::memory_order_relaxed);
+	if (n >= 48 && n % 1024 != 0) {
+		return;
+	}
+	const char* kind = opcode == Pm4::IT_SET_SH_REG_INDIRECT        ? "SH"
+	                   : opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? "context"
+	                                                                : "uconfig";
+	LOGF("DrawPrep taint #%u: queue %u, %s pairs at 0x%016" PRIx64 " (%u): %s\n", n, queue, kind,
+	     address, count, reason);
+	Profiler::Message(Profiler::MessageWarning,
+	                  "DrawPrep taint #%u: queue %u, %s pairs at 0x%016" PRIx64 " (%u): %s", n, queue,
+	                  kind, address, count, reason);
+}
+
+// KYTY_DRAW_PREP_RESYNC=0: a taint lasts until the queue's next reset, as before.
+bool ResyncEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_PREP_RESYNC");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The packet a scanner waits at (Resync), and the registers the GPU thread hands it there.
+struct ResyncChannel {
+	std::mutex              mutex;
+	std::condition_variable delivered;
+	uint32_t                queue   = 0;
+	uint64_t                seq     = 0;
+	uint32_t                ordinal = 0;
+	const uint32_t*         packet  = nullptr;
+	bool                    ready   = false;
+	HW::Context             ctx;
+	HW::Context             saved_ctx;
+	HW::Shader              sh;
+	HW::UserConfig          ucfg;
+	bool                    pushed = false;
+	HW::UserSgprType        marker = HW::UserSgprType::Unknown;
+};
+
+ResyncChannel& GetResyncChannel() {
+	static auto* channel = new ResyncChannel;
+	return *channel;
+}
+
 } // namespace
+
+void DrawPrepScanner::DeliverRegisters(uint32_t queue, uint64_t seq, uint32_t ordinal,
+                                       const uint32_t* packet, CommandProcessor& cp) {
+	KYTY_PROFILER_BLOCK("DrawPrep::DeliverRegisters");
+	auto&           channel = GetResyncChannel();
+	std::lock_guard lock(channel.mutex);
+	// The scanner clears the want under this lock when it stops waiting.
+	if (s_resync_want.load(std::memory_order_relaxed) != ResyncTag(seq, ordinal) || channel.ready ||
+	    channel.queue != queue || channel.seq != seq || channel.ordinal != ordinal ||
+	    channel.packet != packet) {
+		return;
+	}
+	channel.ctx       = cp.GetCtx();
+	channel.saved_ctx = cp.GetSavedCtx();
+	channel.sh        = cp.GetShCtx();
+	channel.ucfg      = cp.GetUcfg();
+	channel.pushed    = cp.IsContextStatePushed();
+	channel.marker    = cp.GetUserDataMarker();
+	channel.ready     = true;
+	channel.delivered.notify_one();
+}
+
+// A taint used to last until the queue's next suspend point: one failed indirect table cost the
+// 45-300 draws after it their preparation (UFC 5: 2-8 % of all draws, ~0.5 ms of the GPU thread a
+// frame, 2026-10-24). Instead the scanner waits at the next draw for the GPU thread's registers
+// before it, and goes on from there with a copy it can trust. Its lead is gone then, but it walks a
+// draw in a third of the GPU thread's time and is ahead again within a few draws.
+bool DrawPrepScanner::Resync(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {
+	if (!ResyncEnabled() || m_state->no_resync) {
+		return false;
+	}
+	const DrawPrep::Key key {.queue = m_queue, .seq = seq, .ordinal = ordinal, .packet = packet};
+	if (!DrawPrep::GpuProgress(m_queue).Before(key)) {
+		// At or past this packet the GPU thread offers nothing; tried again at the next one.
+		DrawPrep::Add(DrawPrep::Counter::ResyncPassed);
+		return false;
+	}
+	auto&            channel = GetResyncChannel();
+	std::unique_lock lock(channel.mutex);
+	channel.queue   = m_queue;
+	channel.seq     = seq;
+	channel.ordinal = ordinal;
+	channel.packet  = packet;
+	channel.ready   = false;
+	s_resync_want.store(ResyncTag(seq, ordinal), std::memory_order_release);
+	// The scanner can lead by thousands of packets (DrawPrep's MaxPending), so the wait may be long.
+	// It ends early when the GPU thread goes past without offering (it read the want before it was
+	// set, or its packets diverged from the scanner's).
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+	bool       passed   = false;
+	while (!channel.ready) {
+		channel.delivered.wait_for(lock, std::chrono::milliseconds(1));
+		if (channel.ready) {
+			break;
+		}
+		if (key.Before(DrawPrep::GpuProgress(m_queue))) {
+			passed = true;
+			break;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			break;
+		}
+	}
+	s_resync_want.store(0, std::memory_order_relaxed);
+	if (!channel.ready) {
+		if (passed) {
+			DrawPrep::Add(DrawPrep::Counter::ResyncPassed);
+		} else {
+			m_state->no_resync = true;
+			DrawPrep::Add(DrawPrep::Counter::ResyncTimeout);
+		}
+		return false;
+	}
+	channel.ready = false;
+	auto& cp      = *m_state->cp;
+	cp.GetCtx()   = channel.ctx;
+	cp.GetShCtx() = channel.sh;
+	cp.GetUcfg()  = channel.ucfg;
+	cp.SetUserDataMarker(channel.marker);
+	*m_state->saved_ctx = channel.saved_ctx;
+	m_state->pushed     = channel.pushed;
+	m_state->tainted    = false;
+	DrawPrep::Add(DrawPrep::Counter::Resynced);
+	return true;
+}
 
 DrawPrepScanner::DrawPrepScanner(RenderContext& renderer): m_renderer(renderer) {
 	m_thread = std::thread([this] { Run(); });
@@ -98,8 +240,9 @@ void DrawPrepScanner::Run() {
 		if (item.seq == 0) {
 			// The GPU thread resets its command processor at a suspend point.
 			m_state->cp->Reset();
-			m_state->pushed  = false;
-			m_state->tainted = false;
+			m_state->pushed    = false;
+			m_state->tainted   = false;
+			m_state->no_resync = false;
 		} else {
 			Scan(item);
 		}
@@ -147,7 +290,9 @@ void DrawPrepScanner::ApplyContextState(uint32_t operation) {
 // and handed to the command processor's own handler from a local copy. False when the pairs
 // cannot be read that way (the GPU wrote them): the register copy is then unreliable.
 bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* body) {
+	const auto opcode = (header >> 8u) & 0xffu;
 	if (KYTY_PM4_LEN(header) != 5u) {
+		ReportIndirectTaint(m_queue, opcode, 0, 0, "packet length");
 		return false;
 	}
 	const uint64_t address =
@@ -157,15 +302,20 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 		return true;
 	}
 	if (address == 0) {
+		ReportIndirectTaint(m_queue, opcode, address, count, "null address");
 		return false;
 	}
 	thread_local std::vector<uint32_t> pairs;
 	pairs.resize(static_cast<size_t>(count) * 2u);
 	if (!LibKernel::Memory::TryReadGpuCleanBacking(address, pairs.data(),
 	                                               pairs.size() * sizeof(uint32_t))) {
+		ReportIndirectTaint(m_queue, opcode, address, count,
+		                    LibKernel::Memory::TryReadBacking(address, pairs.data(),
+		                                                      pairs.size() * sizeof(uint32_t))
+		                        ? "may be GPU-written"
+		                        : "no backing");
 		return false;
 	}
-	const auto opcode = (header >> 8u) & 0xffu;
 	// The scanner reads ahead of the GPU thread, so the table may not be written yet: offsets the
 	// GPU thread's handlers reject (they exit) taint the scan instead (UFC 5: an SH pair 0x401d2c00,
 	// 2026-10-17). The GPU thread reads the table again when it executes the packet.
@@ -175,6 +325,9 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 	for (uint32_t i = 0; i < count && limit != UINT32_MAX; i++) {
 		const uint32_t raw = pairs[static_cast<size_t>(i) * 2u];
 		if (raw != 0xffffffffu && (raw & ~0x70000000u) >= limit) {
+			char reason[48];
+			snprintf(reason, sizeof(reason), "pair %u offset 0x%08x", i, raw);
+			ReportIndirectTaint(m_queue, opcode, address, count, reason);
 			return false;
 		}
 	}
@@ -187,6 +340,8 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 
 void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {
 	if (m_state->tainted) {
+		// Resynced or not, this packet is the GPU thread's to walk: it is running it.
+		(void)Resync(seq, ordinal, packet);
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;
 	}
@@ -218,6 +373,8 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet,
                                    uint32_t opcode) {
 	if (m_state->tainted) {
+		// Resynced or not, this packet is the GPU thread's to walk: it is running it.
+		(void)Resync(seq, ordinal, packet);
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;
 	}

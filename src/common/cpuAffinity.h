@@ -38,7 +38,8 @@ enum class ThreadClass {
 // parsing the command line, before any thread is placed.
 void SetCpuPlacementEnabled(bool enabled);
 
-// Applies the placement for `cls` to the calling thread. `name` is for the log line.
+// Applies the placement for `cls` to the calling thread. `name` is for the log line, and names
+// the thread for Tracy and the debugger (with --profile).
 void PlaceCurrentThread(ThreadClass cls, const char* name);
 
 // Reads the topology, reserves the critical cores and sets the process's default placement

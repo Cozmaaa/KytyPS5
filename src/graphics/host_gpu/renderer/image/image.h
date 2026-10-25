@@ -171,6 +171,8 @@ public:
 	// TextureCache's sequence number of the last native write (CommitGpuWrite and copies), to
 	// order the writes of one-texel aliases (TextureCache::OverwritesTexel).
 	uint64_t gpu_write_seq = 0;
+	// BufferCache::ForgetKnownFills's generation at this image's last write (CommitGpuWrite).
+	uint64_t known_fills_generation = 0;
 	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
 	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
 	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip

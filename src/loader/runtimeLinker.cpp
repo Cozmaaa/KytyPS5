@@ -683,6 +683,11 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 			     Common::HostBacktrace().c_str());
 		}
 	}
+	// The site table is only reported through the log: without one, every guest thread's fault
+	// would serialize on its mutex for nothing.
+	if (Log::IsSilent()) {
+		return;
+	}
 	std::scoped_lock lock(g_fault_stats.mutex);
 	auto&            stats = g_fault_stats;
 	stats.total++;
@@ -752,11 +757,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// One zone a fault (value: the guest address), so Tracy shows the game threads' faults;
+		// counted per frame as CPU write faults, CPU read faults and CPU fault ms.
+		KYTY_PROFILER_NAMED_BLOCK(fault_zone, "Guest fault");
+		fault_zone.Value(info->access_violation_vaddr);
 		const auto started = std::chrono::steady_clock::now();
-		const auto elapsed = [started] {
-			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                 std::chrono::steady_clock::now() - started)
-			                                 .count());
+		const auto record  = [&](bool is_read, bool emulated) {
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                           std::chrono::steady_clock::now() - started)
+			                                           .count());
+			Profiler::Add(is_read ? Profiler::Counter::CpuReadFaults : Profiler::Counter::CpuWriteFaults);
+			Profiler::Add(Profiler::Counter::CpuFaultTime, static_cast<int64_t>(ns));
+			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, is_read,
+			                   Libs::Graphics::GuestGpu::IsGpuThread(), ns / 1000u, emulated);
 		};
 		// A read of bytes the GPU has not written, on a page protected because it wrote others:
 		// complete the load from the backing store and leave the page protected. Otherwise the
@@ -768,14 +781,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		    Loader::X64InstructionEmulator::TryEmulateLoad(
 		        info->native_context, info->access_violation_vaddr,
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
-			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
-			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
+			record(true, true);
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
-			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
-			                   elapsed(), false);
+			record(access == GpuAccess::Read, false);
 			return true;
 		}
 	}

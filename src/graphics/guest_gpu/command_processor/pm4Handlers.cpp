@@ -94,8 +94,8 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 // fault handler emulates it, so one packet can cost many exceptions. In UFC 5 fights the CX
 // packets alone took ~15 us each and 30% of the GPU thread (Tracy, 2026-10-10), while the
 // draw-prep scanner, which copies the same pairs out first, ran them at ~0.2 us.
-// On the GPU thread the pairs are copied with one clean-backing read, as the scanner does. When
-// the bytes may be GPU-written the copy is refused and the handler reads guest memory directly,
+// On the GPU thread the pairs are read from their clean backing, in place or copied, as the
+// scanner does. When the bytes may be GPU-written the read is refused and the handler reads guest memory directly,
 // as before, so the fault path still downloads them first.
 // KYTY_INDIRECT_CLEAN_COPY=0 always reads guest memory directly.
 bool IndirectCleanCopyEnabled() {
@@ -119,16 +119,26 @@ const uint32_t* IndirectRegisterPairs(const uint32_t* guest_pairs, uint32_t num_
 		return guest_pairs;
 	}
 	KYTY_PROFILER_BLOCK("IndirectRegisterPairs (clean copy)");
-	thread_local std::vector<uint32_t> copy;
-	copy.resize(static_cast<size_t>(num_pairs) * 2u);
-	const bool copied = LibKernel::Memory::TryReadGpuCleanBacking(
-	    reinterpret_cast<uint64_t>(guest_pairs), copy.data(), copy.size() * sizeof(uint32_t));
-	(copied ? g_indirect_copied : g_indirect_direct)++;
+	const auto address = reinterpret_cast<uint64_t>(guest_pairs);
+	const auto bytes   = static_cast<uint64_t>(num_pairs) * 2u * sizeof(uint32_t);
+	// A table in one mapping is read in place from its clean backing: FindBacking's thread cache
+	// skips the mapping lock and search, and nothing is copied (~3,900 tables a frame in a UFC 5
+	// fight, 135 ns each with the copy). The handler is done with them before the next packet.
+	const auto* pairs =
+	    reinterpret_cast<const uint32_t*>(LibKernel::Memory::FindGpuCleanBacking(address, bytes));
+	if (pairs == nullptr) {
+		thread_local std::vector<uint32_t> copy;
+		copy.resize(static_cast<size_t>(num_pairs) * 2u);
+		if (LibKernel::Memory::TryReadGpuCleanBacking(address, copy.data(), bytes)) {
+			pairs = copy.data();
+		}
+	}
+	(pairs != nullptr ? g_indirect_copied : g_indirect_direct)++;
 	if (((g_indirect_copied + g_indirect_direct) & ((uint64_t {1} << 20u) - 1u)) == 0) {
-		LOGF("Indirect register pairs: %" PRIu64 " copied, %" PRIu64 " read from guest memory\n",
+		LOGF("Indirect register pairs: %" PRIu64 " clean, %" PRIu64 " read from guest memory\n",
 		     g_indirect_copied, g_indirect_direct);
 	}
-	return copied ? copy.data() : guest_pairs;
+	return pairs != nullptr ? pairs : guest_pairs;
 }
 
 } // namespace
@@ -2486,7 +2496,7 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_FINE_FUNCTION(); // ~20,000 a frame in a UFC 5 fight, 14 ns each
 
 	auto cmd_offset = buffer[0];
 	if (cmd_offset == Pm4::SH_NOP) {
